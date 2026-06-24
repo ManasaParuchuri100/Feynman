@@ -1,0 +1,10 @@
+{
+  "name": "Feynman",
+  "description": "An interactive Feynman Technique companion that helps you 'teach to learn'. Upload files, extract concepts, and explain them back to Feynman to master your understanding.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,93 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile with study statistics, streak, and preferences.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "streak": { "type": "integer" },
+        "avgMastery": { "type": "integer" },
+        "totalTopicsMastered": { "type": "integer" },
+        "topicsMastered": { "type": "integer" },
+        "totalTimeStudied": { "type": "integer" },
+        "createdAt": { "type": "string" },
+        "lastLogin": { "type": "string" },
+        "settings": { "type": "object" }
+      },
+      "required": ["uid", "email"]
+    },
+    "Upload": {
+      "title": "Upload",
+      "description": "Information about an uploaded study file or pasted text.",
+      "type": "object",
+      "properties": {
+        "fileName": { "type": "string" },
+        "fileType": { "type": "string" },
+        "fileUrl": { "type": "string" },
+        "uploadedAt": { "type": "string" },
+        "extractedTopicsCount": { "type": "integer" },
+        "knowledgeMap": { "type": "string" }
+      },
+      "required": ["fileName", "fileType", "fileUrl", "uploadedAt"]
+    },
+    "Topic": {
+      "title": "Topic",
+      "description": "Concept topic extracted from an upload for active recall practice.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "summary": { "type": "string" },
+        "difficulty": { "type": "string" },
+        "mastery": { "type": "integer" },
+        "status": { "type": "string" },
+        "latestExplanation": { "type": "string" },
+        "latestFeedback": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["title", "summary", "difficulty", "mastery", "status", "updatedAt"]
+    },
+    "Attempt": {
+      "title": "Attempt",
+      "description": "An explanation recall execution attempt with grades and Feynman reviews.",
+      "type": "object",
+      "properties": {
+        "explanation": { "type": "string" },
+        "simplicity": { "type": "integer" },
+        "completeness": { "type": "integer" },
+        "accuracy": { "type": "integer" },
+        "grade": { "type": "integer" },
+        "followUpQuestion": { "type": "string" },
+        "gaps": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "reviewed": { "type": "boolean" },
+        "review": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["explanation", "simplicity", "completeness", "accuracy", "grade", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profiles root collection"
+    },
+    "/users/{userId}/uploads/{uploadId}": {
+      "schema": "Upload",
+      "description": "Saved file uploads subcollection"
+    },
+    "/users/{userId}/uploads/{uploadId}/topics/{topicId}": {
+      "schema": "Topic",
+      "description": "Topics/concepts subcollection nested under uploads"
+    },
+    "/users/{userId}/uploads/{uploadId}/topics/{topicId}/attempts/{attemptId}": {
+      "schema": "Attempt",
+      "description": "Recall practice attempts nested under topics"
+    }
+  }
+}
