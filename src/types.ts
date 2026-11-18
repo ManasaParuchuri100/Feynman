@@ -85,6 +85,7 @@ export interface FeynmanSession {
     completeness: number; // 0 - 100
     gaps: string[];
     suggestions: string;
+    diagramUnderstanding?: string;
   };
 }
 

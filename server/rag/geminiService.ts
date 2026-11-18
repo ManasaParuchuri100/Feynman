@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
 import type {
   DocumentStructure,
@@ -253,7 +254,7 @@ export async function transcribeImageStudyMaterial(
           },
         },
         {
-          text: `Transcribe all visible text, headings, formulas, tables, labels, and diagram relationships from this study image ("${fileName}") cleanly in Markdown format. Preserve exact terms and mathematical notation without adding outside facts.`,
+          text: `Read this study image ("${fileName}") as ideas, not as pixels. Transcribe visible text, headings, formulas, and labels, then describe each diagram by the parts it contains and the relationships it claims (arrows, sequence, cause, containment, comparison, or flow). Ignore line style, colors, spacing, and layout. Write clean Markdown and do not add facts that are not in the image.`,
         },
       ],
     },
@@ -437,6 +438,7 @@ export async function evaluateFeynmanWithRag(params: {
   completeness: number;
   gaps: string[];
   suggestions: string;
+  diagramUnderstanding: string;
 }> {
   const {
     conceptTitle,
@@ -477,10 +479,16 @@ User's Explanation/Teaching:
 "${userExplanation}"
 
 Scoring Rubric (0 to 100 on each):
-- 'clarity': Coherence and step-by-step logical flow.
-- 'accuracy': Factual correctness against the retrieved source passages and any diagrams/sketches.
+- 'clarity': Coherence and step-by-step logical flow of the explanation and, when a diagram is attached, whether its structure can be read as a clear argument.
+- 'accuracy': Factual correctness of the ideas against the retrieved source passages. When a diagram or sketch is attached, accuracy is how well the diagram's meaning matches the concept, never how the pixels, strokes, or layout look.
 - 'simplicity': Translates technical jargon into intuitive everyday language/analogies a 10-year-old could grasp.
 - 'completeness': Covers the essential mechanisms, definitions, or formulas for "${conceptTitle}" present in the retrieved passages (without penalizing for unrelated document sections).
+
+Diagram grading (apply whenever one or more diagrams, sketches, or whiteboard images are attached):
+1. Ignore pixels. Do not score overlap, alignment, resolution, line straightness, handwriting, color, spacing, canvas size, artistic style, or how closely the picture resembles a textbook figure.
+2. First write 'diagramUnderstanding': a short reading of what the diagram means. Name the parts, labels, arrows or groupings, the relationship each connection claims (cause, sequence, containment, comparison, flow), and the idea the student is teaching. If no diagram is attached, set this to an empty string.
+3. Derive diagram accuracy only from that reading compared with the retrieved passages. A rough sketch with the right entities and relationships is accurate. A neat drawing with the wrong mechanism, reversed causality, or mislabeled parts is not.
+4. Put conceptual mistakes in 'gaps' (wrong relationship, missing mechanism, swapped labels). Do not list visual defects.
 
 Score Calibration:
 - 0-20: Empty, under 15 words, noise/greetings, or "I don't know".
@@ -489,8 +497,9 @@ Score Calibration:
 - 80-100: Accurate, complete for this concept, clear, and genuinely simplified.
 
 Provide:
-- 'gaps': Specific missing details, misconceptions, or unexplained jargon compared against the retrieved source passages (cite page numbers when available).
-- 'feedbackText': Curious, friendly in-character response from Feynman with one targeted follow-up question tailored to the lowest-scoring dimension (or an advanced "what-if" grounded in the retrieved passages if all scores >= 80). Reference any whiteboard drawings if supplied.
+- 'diagramUnderstanding': The meaning you read from any attached diagram, as specified above. Empty string when no diagram is attached.
+- 'gaps': Specific missing details, misconceptions, or unexplained jargon compared against the retrieved source passages (cite page numbers when available). For a diagram, name wrong or missing relationships, not how the drawing looks.
+- 'feedbackText': Curious, friendly in-character response from Feynman with one targeted follow-up question tailored to the lowest-scoring dimension (or an advanced "what-if" grounded in the retrieved passages if all scores >= 80). If a diagram was attached, react to the idea it conveys.
 - 'suggestions': Actionable advice for simplifying or filling the identified gaps.
 `;
 
@@ -523,6 +532,7 @@ Provide:
         type: Type.OBJECT,
         properties: {
           feedbackText: { type: Type.STRING },
+          diagramUnderstanding: { type: Type.STRING },
           clarity: { type: Type.NUMBER },
           accuracy: { type: Type.NUMBER },
           simplicity: { type: Type.NUMBER },
@@ -532,6 +542,7 @@ Provide:
         },
         required: [
           "feedbackText",
+          "diagramUnderstanding",
           "clarity",
           "accuracy",
           "simplicity",

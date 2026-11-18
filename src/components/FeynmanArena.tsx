@@ -294,6 +294,7 @@ export default function FeynmanArena({
       gaps: string[];
       suggestions: string;
       feedbackText: string;
+      diagramUnderstanding?: string;
       citations?: RetrievalCitation[];
       retrievalLatencyMs?: number;
     };
@@ -1218,7 +1219,7 @@ export default function FeynmanArena({
     const compiledParts = [
       ...explanationBlocks.map(b => {
         if (b.type === "drawing") {
-          return "[Teacher Board Diagram sktech / sketchpad drawing added]";
+          return "[Student diagram attached. Grade the idea it expresses: parts, labels, and relationships. Ignore pixels, neatness, and visual similarity to any reference figure.]";
         }
         return b.content;
       }),
@@ -1226,7 +1227,7 @@ export default function FeynmanArena({
     ].filter(Boolean);
 
     if (strokes.length > 0) {
-      compiledParts.push("[Active Teacher Board Diagram sketch / sketchpad drawing added]");
+      compiledParts.push("[Student diagram attached. Grade the idea it expresses: parts, labels, and relationships. Ignore pixels, neatness, and visual similarity to any reference figure.]");
     }
 
     if (compiledParts.length === 0 || isGrading) return;
@@ -1292,6 +1293,7 @@ export default function FeynmanArena({
           gaps: Array.isArray(evalData.gaps) ? evalData.gaps : [],
           suggestions: evalData.suggestions || "Focus on tying key mechanisms to a concrete real-world example.",
           feedbackText: evalData.feedbackText || "Great explanation! How would you test whether someone truly understood this idea?",
+          diagramUnderstanding: typeof evalData.diagramUnderstanding === "string" ? evalData.diagramUnderstanding : "",
           citations: Array.isArray(evalData.citations) ? evalData.citations : [],
           retrievalLatencyMs: evalData.retrievalLatencyMs,
         }
@@ -2460,9 +2462,27 @@ export default function FeynmanArena({
                         style={{ width: `${activeScoreCard.accuracy}%` }}
                       />
                     </div>
+                    {activeScoreCard.diagramUnderstanding ? (
+                      <p className="text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                        Scored from the idea the diagram expresses, not from pixels or how closely it matches a reference figure.
+                      </p>
+                    ) : null}
                   </div>
 
                 </div>
+
+                {activeScoreCard.diagramUnderstanding ? (
+                  <div className="space-y-3" id="diagram-understanding-section">
+                    <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 tracking-tight">
+                      What the diagram means
+                    </h3>
+                    <div className="bg-white dark:bg-[#0E0E1D] border border-slate-200/90 dark:border-white/[0.08] px-4 py-3.5 rounded-xl shadow-xs">
+                      <p className="text-xs md:text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
+                        {activeScoreCard.diagramUnderstanding}
+                      </p>
+                    </div>
+                  </div>
+                ) : null}
 
                 {/* Gaps in Understanding List */}
                 <div className="space-y-3" id="gaps-understanding-section">

@@ -1,7 +1,7 @@
+import "dotenv/config";
 import express from "express";
 import fs from "node:fs";
 import path from "node:path";
-import dotenv from "dotenv";
 import multer from "multer";
 import { createServer as createViteServer } from "vite";
 import { AuthError, resolveRequestUser } from "./server/rag/auth.ts";
@@ -21,10 +21,8 @@ import {
   getParentChunks,
 } from "./server/rag/vectorStore.ts";
 
-dotenv.config();
-
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: "60mb" }));
 app.use(express.urlencoded({ limit: "60mb", extended: true }));
