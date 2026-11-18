@@ -1,11 +1,57 @@
+export type RagStage =
+  | "queued"
+  | "extracting"
+  | "chunking"
+  | "embedding"
+  | "indexing"
+  | "summarizing"
+  | "ready"
+  | "error";
+
+export interface ChapterSummary {
+  title: string;
+  pageStart: number;
+  pageEnd: number;
+  summary: string;
+  keyTerms: string[];
+}
+
+export interface KeyDefinition {
+  term: string;
+  definition: string;
+  pageNumber?: number;
+}
+
+export interface RetrievalCitation {
+  chunkId: string;
+  parentId: string;
+  sectionTitle: string;
+  pageNumber: number;
+  pageStart: number;
+  pageEnd: number;
+  score: number;
+  excerpt: string;
+  isAdjacent?: boolean;
+}
+
 export interface UploadedFile {
   id: string;
   name: string;
   size: number;
   type: string;
-  content: string; // The text content or base64 data url
+  content: string; // The text content, base64 data url, or /api/rag/document/:id/file reference
   uploadedAt: string;
   knowledgeMap?: string;
+  contentHash?: string;
+  ragStage?: RagStage;
+  ragProgress?: number;
+  ragMessage?: string;
+  ragError?: string;
+  pageCount?: number;
+  chunkCount?: number;
+  documentOverview?: string;
+  chapters?: ChapterSummary[];
+  keyDefinitions?: KeyDefinition[];
 }
 
 export interface Concept {
@@ -14,6 +60,9 @@ export interface Concept {
   difficulty: "Easy" | "Medium" | "Hard";
   summary: string;
   suggestedExplanationPrompt: string;
+  pageStart?: number;
+  pageEnd?: number;
+  sectionTitle?: string;
 }
 
 export interface ChatMessage {
@@ -59,9 +108,9 @@ export interface UserProfile {
   photoURL: string;
   streak?: number;
   avgMastery?: number;
-  totalTimeStudied: number; // stored in seconds or minutes
   totalTopicsMastered: number;
   topicsMastered?: number; // matches image schema field key exactly
+  totalTimeStudied: number; // stored in seconds or minutes
   createdAt: string;
   lastLogin: string;
   settings: Record<string, any>;
@@ -84,4 +133,3 @@ export interface SourcesResponse {
   topics: string[];
   resources: StudyResource[];
 }
-

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { UploadedFile, Concept, ChatMessage, Flashcard } from "../types";
+import { UploadedFile, Concept, ChatMessage, Flashcard, RetrievalCitation } from "../types";
 import { 
   ArrowLeft, 
   PanelLeftOpen,
@@ -57,11 +57,16 @@ import {
 } from "../lib/firebase";
 import { UserProfile } from "../types";
 import SourcesTab from "./SourcesTab";
+import ThemeToggle from "./ThemeToggle";
+import { useTheme } from "../lib/theme";
+import PdfViewer from "./PdfViewer";
+import { authFetch } from "../lib/api";
 
 interface FeynmanArenaProps {
   file: UploadedFile;
   allFiles?: UploadedFile[];
   onBack: () => void;
+  onUpdateFileMeta?: (fileId: string, patch: Partial<UploadedFile>) => void;
   isSidebarCollapsed?: boolean;
   onToggleSidebar?: () => void;
 }
@@ -88,9 +93,11 @@ export default function FeynmanArena({
   file,
   allFiles,
   onBack,
+  onUpdateFileMeta,
   isSidebarCollapsed = false,
   onToggleSidebar
 }: FeynmanArenaProps) {
+  const { theme } = useTheme();
   const [activeTab, setActiveTab] = useState<TabType>("explain");
   const [currentUser, setCurrentUser] = useState<any>(null);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
@@ -112,6 +119,11 @@ export default function FeynmanArena({
   const [concepts, setConcepts] = useState<Concept[]>([]);
   const [selectedConcept, setSelectedConcept] = useState<Concept | null>(null);
   const [isSourceDocumentOpen, setIsSourceDocumentOpen] = useState(false);
+  const [pdfActionUrl, setPdfActionUrl] = useState<string | null>(null);
+  const [pdfPageCount, setPdfPageCount] = useState<number | null>(null);
+  const [previewSections, setPreviewSections] = useState<Array<{ id: string; title: string; pageStart: number; pageEnd: number; text: string }>>([]);
+  const [loadingPreview, setLoadingPreview] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
 
   // Flashcards quiz state
   const [mapSubView, setMapSubView] = useState<"orbit" | "quiz">("orbit");
@@ -216,13 +228,18 @@ export default function FeynmanArena({
     if (loadingFlashcards) return;
     setLoadingFlashcards(true);
     try {
-      const res = await fetch("/api/document/flashcards", {
+      const inlineContent =
+        file.content && !file.content.startsWith("/api/") && file.content.length < 300_000
+          ? file.content
+          : undefined;
+      const res = await authFetch("/api/document/flashcards", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          fileId: file.id,
           fileName: file.name,
           fileType: file.type,
-          fileContent: file.content,
+          fileContent: inlineContent,
           concepts: concepts
         })
       });
@@ -264,6 +281,7 @@ export default function FeynmanArena({
 
   const [loadingConcepts, setLoadingConcepts] = useState(false);
   const [isGrading, setIsGrading] = useState(false);
+  const [gradingError, setGradingError] = useState<string | null>(null);
   const [errorHeader, setErrorHeader] = useState<string | null>(null);
 
   // Scorecards for each concept
@@ -276,6 +294,8 @@ export default function FeynmanArena({
       gaps: string[];
       suggestions: string;
       feedbackText: string;
+      citations?: RetrievalCitation[];
+      retrievalLatencyMs?: number;
     };
   }>({});
 
@@ -400,6 +420,67 @@ export default function FeynmanArena({
   }, [isSourceDocumentOpen]);
 
   useEffect(() => {
+    if (!isSourceDocumentOpen) {
+      setPdfActionUrl(null);
+      setPdfPageCount(null);
+      setPreviewSections([]);
+      setPreviewError(null);
+      return;
+    }
+
+    const lowerName = file.name.toLowerCase();
+    const isPdf = file.type === "application/pdf" || file.content.startsWith("data:application/pdf") || lowerName.endsWith(".pdf");
+    const isImg = Boolean(file.type?.startsWith("image/") || file.content.startsWith("data:image/"));
+    const isPpt = file.type.includes("presentation") || file.type.includes("powerpoint") || lowerName.endsWith(".ppt") || lowerName.endsWith(".pptx");
+
+    if (!isPdf && !isImg && (isPpt || file.content.startsWith("/api/rag/document/"))) {
+      let cancelled = false;
+      setLoadingPreview(true);
+      setPreviewError(null);
+      authFetch(`/api/rag/document/${encodeURIComponent(file.id)}/preview`)
+        .then(async (res) => {
+          if (!res.ok) throw new Error("Unable to load slide preview yet.");
+          return res.json();
+        })
+        .then((data) => {
+          if (!cancelled && Array.isArray(data.sections)) {
+            setPreviewSections(data.sections);
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) setPreviewError(err?.message || "Slide preview unavailable.");
+        })
+        .finally(() => {
+          if (!cancelled) setLoadingPreview(false);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+  }, [isSourceDocumentOpen, file.id, file.ragStage]);
+
+  const handleDownloadOriginalFile = async () => {
+    try {
+      const targetUrl = file.content.startsWith("/api/")
+        ? file.content
+        : `/api/rag/document/${encodeURIComponent(file.id)}/file`;
+      const res = await authFetch(targetUrl);
+      if (!res.ok) throw new Error("Download failed");
+      const blob = await res.blob();
+      const objUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = objUrl;
+      a.download = file.name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(objUrl), 2000);
+    } catch (err) {
+      console.error("Failed to download original file:", err);
+    }
+  };
+
+  useEffect(() => {
     if (concepts && concepts.length > 0 && flashcards.length === 0) {
       const defaults = generateDefaultFlashcardsFromConcepts(concepts);
       setFlashcards(defaults);
@@ -482,7 +563,23 @@ export default function FeynmanArena({
     };
   }, []);
 
-  // Extract concepts from document on mount (with multi-level caching for speed)
+  // Hydrate concepts automatically when background RAG ingestion finishes
+  useEffect(() => {
+    if (!file.knowledgeMap) return;
+    try {
+      const parsed = JSON.parse(file.knowledgeMap);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        setConcepts(parsed);
+        setSelectedConcept((prev) => prev || parsed[0]);
+        setLoadingConcepts(false);
+        setErrorHeader(null);
+      }
+    } catch {
+      // ignore malformed JSON
+    }
+  }, [file.id, file.knowledgeMap]);
+
+  // Extract concepts from document when switching files (keyed ONLY on file.id so polling updates don't wipe user drafts)
   useEffect(() => {
     // Clear state for the new file to prevent bleed-through of previous files' info
     setExplanationText("");
@@ -494,6 +591,8 @@ export default function FeynmanArena({
     setSelectedConcept(null);
     setScoreCards({});
     setRevisedConcepts([]);
+    setGradingError(null);
+    setFlashcards([]);
 
     // Reset speech and audio playing on changing files
     if ('speechSynthesis' in window) {
@@ -512,28 +611,28 @@ export default function FeynmanArena({
       }
     }
 
+    let cancelled = false;
+
     async function fetchConcepts() {
       setLoadingConcepts(true);
       setErrorHeader(null);
 
       // Helper to update localStorage and Firestore caches
-      const updateLocationCaches = (conceptsList: Concept[]) => {
+      const updateLocationCaches = (conceptsList: Concept[], overview?: string) => {
         try {
           const listStr = JSON.stringify(conceptsList);
-          // 1. Update localStorage
-          const storageKey = auth.currentUser ? `feynman_uploaded_files_${auth.currentUser.uid}` : "feynman_uploaded_files_guest";
-          const localCached = localStorage.getItem(storageKey);
-          if (localCached) {
-            const parsedList = JSON.parse(localCached);
-            const idx = parsedList.findIndex((f: any) => f.id === file.id);
-            if (idx !== -1) {
-              parsedList[idx].knowledgeMap = listStr;
-              localStorage.setItem(storageKey, JSON.stringify(parsedList));
-            }
-          }
-          // 2. Update Firestore
+          onUpdateFileMeta?.(file.id, {
+            knowledgeMap: listStr,
+            ...(overview ? { documentOverview: overview } : {}),
+          });
           if (auth.currentUser) {
-            saveUploadedFileToFirestore(auth.currentUser.uid, file.id, file.name, file.content, listStr, conceptsList);
+            saveUploadedFileToFirestore(auth.currentUser.uid, file.id, file.name, file.content, listStr, conceptsList, {
+              contentHash: file.contentHash,
+              ragStatus: file.ragStage || "ready",
+              pageCount: file.pageCount,
+              chunkCount: file.chunkCount,
+              documentOverview: overview || file.documentOverview,
+            });
           }
         } catch (e) {
           console.error("Failed to update cache:", e);
@@ -546,9 +645,11 @@ export default function FeynmanArena({
           try {
             const parsed = JSON.parse(file.knowledgeMap);
             if (Array.isArray(parsed) && parsed.length > 0) {
-              setConcepts(parsed);
-              setSelectedConcept(parsed[0]);
-              setLoadingConcepts(false);
+              if (!cancelled) {
+                setConcepts(parsed);
+                setSelectedConcept(parsed[0]);
+                setLoadingConcepts(false);
+              }
               return;
             }
           } catch (e) {
@@ -566,9 +667,11 @@ export default function FeynmanArena({
             if (foundFile && foundFile.knowledgeMap) {
               const parsed = JSON.parse(foundFile.knowledgeMap);
               if (Array.isArray(parsed) && parsed.length > 0) {
-                setConcepts(parsed);
-                setSelectedConcept(parsed[0]);
-                setLoadingConcepts(false);
+                if (!cancelled) {
+                  setConcepts(parsed);
+                  setSelectedConcept(parsed[0]);
+                  setLoadingConcepts(false);
+                }
                 return;
               }
             }
@@ -584,12 +687,12 @@ export default function FeynmanArena({
             try {
               const parsed = JSON.parse(cloudMap);
               if (Array.isArray(parsed) && parsed.length > 0) {
-                setConcepts(parsed);
-                setSelectedConcept(parsed[0]);
-                
-                // Keep local storage synced for offline instant boot
-                updateLocationCaches(parsed);
-                setLoadingConcepts(false);
+                if (!cancelled) {
+                  setConcepts(parsed);
+                  setSelectedConcept(parsed[0]);
+                  updateLocationCaches(parsed);
+                  setLoadingConcepts(false);
+                }
                 return;
               }
             } catch (e) {
@@ -598,32 +701,42 @@ export default function FeynmanArena({
           }
         }
 
-        // Step 4: Fall back to active API fetch if no cache is available. This runs only ONCE per document!
-        const response = await fetch("/api/document/concepts", {
+        // If background RAG ingestion is actively processing this document, wait for polling hydration
+        const activeStages = new Set(["queued", "extracting", "chunking", "embedding", "indexing", "summarizing"]);
+        if (file.ragStage && activeStages.has(file.ragStage)) {
+          return;
+        }
+
+        // Step 4: Fetch concepts from RAG-aware endpoint (uses cached vector index or ingests compact text)
+        const inlineContent =
+          file.content && !file.content.startsWith("/api/") && file.content.length < 300_000
+            ? file.content
+            : undefined;
+        const response = await authFetch("/api/document/concepts", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            fileId: file.id,
             fileName: file.name,
             fileType: file.type,
-            fileContent: file.content,
+            fileContent: inlineContent,
           }),
         });
 
         if (!response.ok) {
-          throw new Error("Failed to extract concepts from this file");
+          const errPayload = await response.json().catch(() => ({}));
+          throw new Error(errPayload.error || "Failed to extract concepts from this file");
         }
 
         const data = await response.json();
-        if (data && data.concepts) {
+        if (!cancelled && data && data.concepts) {
           setConcepts(data.concepts);
           if (data.concepts.length > 0) {
             setSelectedConcept(data.concepts[0]);
           }
 
-          // Populate caches so next time is instantaneous
-          updateLocationCaches(data.concepts);
+          updateLocationCaches(data.concepts, data.overview);
 
-          // Save individual topics in topics/{topicId} subcollection
           if (auth.currentUser) {
             const uid = auth.currentUser.uid;
             data.concepts.forEach((concept: any) => {
@@ -634,7 +747,6 @@ export default function FeynmanArena({
               });
             });
 
-            // Unlock file uploaded achievement
             saveAchievementToFirestore(uid, "ach_first_upload", {
               title: "First Document Uploaded",
               description: `Uploaded and parsed your first focus study material: "${file.name}".`,
@@ -644,33 +756,21 @@ export default function FeynmanArena({
         }
       } catch (err: any) {
         console.error(err);
-        setErrorHeader(err.message || "An error occurred while analyzing the document.");
-        // Fallback default concepts
-        const fallbackConcepts: Concept[] = [
-          {
-            id: "1",
-            title: "Core Concept",
-            difficulty: "Medium",
-            summary: "The primary learning focus extracted from " + file.name,
-            suggestedExplanationPrompt: "Can you explain the main idea of this document to me in plain words as if I am 10 years old?",
-          },
-          {
-            id: "2",
-            title: "Supporting Argument",
-            difficulty: "Easy",
-            summary: "Specific key evidence and foundational supporting information.",
-            suggestedExplanationPrompt: "What are some examples or proof mentioned here to support the thesis?",
-          }
-        ];
-        setConcepts(fallbackConcepts);
-        setSelectedConcept(fallbackConcepts[0]);
+        if (!cancelled) {
+          setErrorHeader(err.message || "An error occurred while analyzing the document.");
+        }
       } finally {
-        setLoadingConcepts(false);
+        if (!cancelled) {
+          setLoadingConcepts(false);
+        }
       }
     }
 
     fetchConcepts();
-  }, [file]);
+    return () => {
+      cancelled = true;
+    };
+  }, [file.id]);
 
   // Voice Recording with actual SpeechRecognition and continuous updates
   const startVoiceRecording = () => {
@@ -1041,8 +1141,8 @@ export default function FeynmanArena({
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
     
-    // Fill background with a dark color to match theme so drawings pop
-    ctx.fillStyle = "#040416";
+    // Match active canvas background so drawings stay high-contrast in both modes
+    ctx.fillStyle = theme === "dark" ? "#080814" : "#ffffff";
     ctx.fillRect(0, 0, canvasWidth, canvasHeight);
     
     strokesList.forEach((stroke) => {
@@ -1132,6 +1232,7 @@ export default function FeynmanArena({
     if (compiledParts.length === 0 || isGrading) return;
     const finalExplanation = compiledParts.join("\n\n");
     setIsGrading(true);
+    setGradingError(null);
 
     const activeConceptTitle = selectedConcept ? selectedConcept.title : "Document Study";
     const activeConceptSummary = selectedConcept ? selectedConcept.summary : "Full context review";
@@ -1150,15 +1251,22 @@ export default function FeynmanArena({
       if (u) listOfBase64Drawings.push(u);
     }
 
+    const inlineOriginalContent =
+      file.content && !file.content.startsWith("/api/") && file.content.length < 300_000
+        ? file.content
+        : undefined;
+
     try {
-      const response = await fetch("/api/feynman/evaluate", {
+      const response = await authFetch("/api/feynman/evaluate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          fileId: file.id,
+          fileName: file.name,
           conceptTitle: activeConceptTitle,
           conceptSummary: activeConceptSummary,
           userExplanation: finalExplanation,
-          originalContent: file.content,
+          originalContent: inlineOriginalContent,
           fileType: file.type,
           previousChat: [],
           userDrawings: listOfBase64Drawings
@@ -1166,7 +1274,8 @@ export default function FeynmanArena({
       });
 
       if (!response.ok) {
-        throw new Error("Evaluation error content");
+        const errPayload = await response.json().catch(() => ({}));
+        throw new Error(errPayload.error || "Unable to evaluate your explanation right now.");
       }
 
       const evalData = await response.json();
@@ -1176,17 +1285,15 @@ export default function FeynmanArena({
       setScoreCards(prev => ({
         ...prev,
         [conceptKey]: {
-          clarity: evalData.clarity || 90,
-          accuracy: evalData.accuracy !== undefined ? evalData.accuracy : 88,
-          simplicity: evalData.simplicity !== undefined ? evalData.simplicity : 85,
-          completeness: evalData.completeness !== undefined ? evalData.completeness : 92,
-          gaps: evalData.gaps && evalData.gaps.length > 0 ? evalData.gaps : [
-            "The connection between theoretical concepts and real-world applications could be clearer",
-            "Consider explaining the underlying mechanisms in more detail",
-            "Try to include more specific examples to illustrate key points"
-          ],
-          suggestions: evalData.suggestions || "Try explaining using simpler metaphors and split complex concepts into illustrative bullet list criteria.",
-          feedbackText: evalData.feedbackText || "Your explanation was a great start! But wait—how would you explain this specific mechanism in a physical way to a 10 year old?"
+          clarity: evalData.clarity ?? evalData.accuracy ?? 80,
+          accuracy: evalData.accuracy ?? 80,
+          simplicity: evalData.simplicity ?? 80,
+          completeness: evalData.completeness ?? 80,
+          gaps: Array.isArray(evalData.gaps) ? evalData.gaps : [],
+          suggestions: evalData.suggestions || "Focus on tying key mechanisms to a concrete real-world example.",
+          feedbackText: evalData.feedbackText || "Great explanation! How would you test whether someone truly understood this idea?",
+          citations: Array.isArray(evalData.citations) ? evalData.citations : [],
+          retrievalLatencyMs: evalData.retrievalLatencyMs,
         }
       }));
 
@@ -1335,40 +1442,9 @@ export default function FeynmanArena({
       // Directly auto transition to Feedback Tab!
       setActiveTab("feedback");
 
-    } catch (err) {
-      console.error(err);
-      // Fallback evaluation structure matching screenshot exactly if API fails
-      const conceptKey = selectedConcept ? selectedConcept.title : "global";
-      setScoreCards(prev => ({
-        ...prev,
-        [conceptKey]: {
-          clarity: 90,
-          accuracy: 88,
-          simplicity: 85,
-          completeness: 92,
-          gaps: [
-            "The connection between theoretical concepts and real-world applications could be clearer",
-            "Consider explaining the underlying mechanisms in more detail",
-            "Try to include more specific examples to illustrate key points"
-          ],
-          suggestions: "Try to link theoretical design processes to daily human physical interactions.",
-          feedbackText: "Feynman asks: That makes perfect sense for designers! But what happens when an extreme edge case walks in? How would you explain that using a kid's board game analogy?"
-        }
-      }));
-
-      // Also log fallback attempt dynamically
-      const newLog = {
-        date: new Date().toISOString().split("T")[0],
-        concept: conceptKey,
-        score: 88
-      };
-      setStudyLog(prev => {
-        const next = [newLog, ...prev];
-        localStorage.setItem("feynman_study_log", JSON.stringify(next));
-        return next;
-      });
-
-      setActiveTab("feedback");
+    } catch (err: any) {
+      console.error("Evaluation failed:", err);
+      setGradingError(err?.message || "Failed to evaluate your explanation. Please check your connection and try again.");
     } finally {
       setIsGrading(false);
     }
@@ -1386,36 +1462,35 @@ export default function FeynmanArena({
     : null;
 
   return (
-    <div className="flex-1 flex flex-col h-screen overflow-hidden bg-[#03030f] border-l border-[#12122b]" id="feynman-premium-arena">
+    <div className="flex-1 flex flex-col h-screen overflow-hidden bg-[#FAFAFC] dark:bg-[#070711] text-slate-900 dark:text-slate-100 border-l border-slate-200/80 dark:border-white/[0.07] transition-colors duration-200" id="feynman-premium-arena">
       
-      {/* 1. Header Navigation Bar (Matches Screenshot Exactly) */}
-      <div className="flex items-center justify-between border-b border-[#12122b] bg-[#03030f] px-6 py-4 z-10 shrink-0" id="arena-header">
+      {/* 1. Header Navigation Bar */}
+      <div className="flex items-center justify-between gap-4 border-b border-slate-200/80 dark:border-white/[0.07] bg-white/90 dark:bg-[#070711]/90 backdrop-blur-md px-5 md:px-7 py-3.5 z-10 shrink-0" id="arena-header">
         
         {/* Left Aligned: Logo & Subtitled Filename */}
-        <div className="flex flex-col select-none" id="arena-brand-group">
-          <div className="flex items-center space-x-2">
+        <div className="flex flex-col select-none min-w-0" id="arena-brand-group">
+          <div className="flex items-center gap-2">
             {isSidebarCollapsed && onToggleSidebar && (
               <button 
                 id="btn-arena-reopen-sidebar"
                 onClick={onToggleSidebar}
-                className="p-1.5 rounded-lg border border-purple-500/25 bg-purple-500/10 text-purple-300 hover:text-white hover:bg-purple-900/30 transition-all flex items-center justify-center cursor-pointer select-none mr-2 focus:outline-none"
+                className="p-1.5 rounded-lg border border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-white/[0.04] text-violet-600 dark:text-violet-400 hover:bg-violet-50 dark:hover:bg-white/[0.08] transition-all flex items-center justify-center cursor-pointer select-none focus:outline-none shrink-0"
                 title="Open Recent Uploads sidebar"
               >
-                <PanelLeftOpen className="w-4 h-4 text-[#d946ef]" />
+                <PanelLeftOpen className="w-4 h-4" />
               </button>
             )}
             <button 
               id="btn-arena-back-dash"
               onClick={onBack}
-              className="p-1 rounded-md text-slate-500 hover:text-white hover:bg-slate-900 transition-all mr-1.5"
+              className="p-1.5 rounded-lg text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-white/[0.06] transition-all cursor-pointer shrink-0"
               title="Return to home"
             >
               <ArrowLeft className="w-4 h-4" />
             </button>
             <button
               onClick={onBack}
-              className="text-xl md:text-2xl font-black tracking-[0.2em] text-[#faf9ff] hover:text-[#d946ef] transition-colors cursor-pointer text-left focus:outline-none"
-              style={{ fontFamily: "'Space Grotesk', system-ui, sans-serif" }}
+              className="text-lg md:text-xl font-extrabold tracking-[0.18em] text-slate-900 dark:text-white hover:text-violet-600 dark:hover:text-violet-400 transition-colors cursor-pointer text-left focus:outline-none whitespace-nowrap"
               title="Return to home page"
             >
               FEYNMAN
@@ -1424,24 +1499,26 @@ export default function FeynmanArena({
           <button 
             id="btn-view-source"
             onClick={() => setIsSourceDocumentOpen(true)}
-            className="text-xs text-slate-400 hover:text-purple-300 font-medium tracking-wide mt-0.5 ml-8 flex items-center space-x-1.5 hover:underline transition-all cursor-pointer text-left focus:outline-none max-w-[200px] md:max-w-[320px]"
+            className="text-xs text-slate-500 dark:text-slate-400 hover:text-violet-600 dark:hover:text-violet-300 font-medium mt-0.5 ml-8 flex items-center gap-1.5 hover:underline transition-all cursor-pointer text-left focus:outline-none max-w-[200px] md:max-w-[320px]"
             title={`Click to view uploaded file: ${file.name}`}
           >
             <span className="truncate">{file.name}</span>
-            <BookOpen className="w-3 h-3 text-purple-400 shrink-0" />
+            <BookOpen className="w-3 h-3 text-violet-600 dark:text-violet-400 shrink-0" />
           </button>
         </div>
 
-        {/* Center / Right Aligned Nav Pill Group and Profile indicators */}
-        <div className="flex items-center space-x-3 md:space-x-5" id="arena-header-controls">
-          <div className="flex items-center space-x-2 md:space-x-3" id="arena-tabs">
+        {/* Center / Right Aligned Nav Group + Theme Toggle */}
+        <div className="flex items-center gap-3 md:gap-4 shrink-0" id="arena-header-controls">
+          <nav className="flex items-center gap-1 overflow-x-auto no-scrollbar" id="arena-tabs">
             
             {/* Explain it Tab */}
             <button
               id="tab-toggle-explain"
               onClick={() => setActiveTab("explain")}
-              className={`px-1.5 py-1 text-xs md:text-sm font-medium tracking-wide transition-all cursor-pointer ${
-                activeTab === "explain" ? "text-[#d946ef]" : "text-slate-400 hover:text-slate-200"
+              className={`px-3 py-1.5 rounded-lg text-xs md:text-sm font-medium transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                activeTab === "explain"
+                  ? "bg-violet-50 dark:bg-violet-500/15 text-violet-700 dark:text-violet-300 font-semibold"
+                  : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-100/70 dark:hover:bg-white/[0.04]"
               }`}
             >
               Explain it
@@ -1451,8 +1528,10 @@ export default function FeynmanArena({
             <button
               id="tab-toggle-feedback"
               onClick={() => setActiveTab("feedback")}
-              className={`px-1.5 py-1 text-xs md:text-sm font-medium tracking-wide transition-all cursor-pointer ${
-                activeTab === "feedback" ? "text-[#d946ef]" : "text-slate-400 hover:text-slate-200"
+              className={`px-3 py-1.5 rounded-lg text-xs md:text-sm font-medium transition-all cursor-pointer whitespace-nowrap shrink-0 tabular-nums ${
+                activeTab === "feedback"
+                  ? "bg-violet-50 dark:bg-violet-500/15 text-violet-700 dark:text-violet-300 font-semibold"
+                  : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-100/70 dark:hover:bg-white/[0.04]"
               }`}
             >
               Feedback {computedGrade !== null && `(${computedGrade}%)`}
@@ -1462,8 +1541,10 @@ export default function FeynmanArena({
             <button
               id="tab-toggle-map"
               onClick={() => setActiveTab("map")}
-              className={`px-1.5 py-1 text-xs md:text-sm font-medium tracking-wide transition-all cursor-pointer ${
-                activeTab === "map" ? "text-[#d946ef]" : "text-slate-400 hover:text-slate-200"
+              className={`px-3 py-1.5 rounded-lg text-xs md:text-sm font-medium transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                activeTab === "map"
+                  ? "bg-violet-50 dark:bg-violet-500/15 text-violet-700 dark:text-violet-300 font-semibold"
+                  : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-100/70 dark:hover:bg-white/[0.04]"
               }`}
             >
               Knowledge Map
@@ -1473,8 +1554,10 @@ export default function FeynmanArena({
             <button
               id="tab-toggle-sources"
               onClick={() => setActiveTab("sources")}
-              className={`px-1.5 py-1 text-xs md:text-sm font-medium tracking-wide transition-all cursor-pointer ${
-                activeTab === "sources" ? "text-[#d946ef]" : "text-slate-400 hover:text-slate-200"
+              className={`px-3 py-1.5 rounded-lg text-xs md:text-sm font-medium transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                activeTab === "sources"
+                  ? "bg-violet-50 dark:bg-violet-500/15 text-violet-700 dark:text-violet-300 font-semibold"
+                  : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-100/70 dark:hover:bg-white/[0.04]"
               }`}
             >
               Sources
@@ -1484,16 +1567,59 @@ export default function FeynmanArena({
             <button
               id="tab-toggle-progress"
               onClick={() => setActiveTab("progress")}
-              className={`px-1.5 py-1 text-xs md:text-sm font-medium tracking-wide transition-all cursor-pointer ${
-                activeTab === "progress" ? "text-[#d946ef]" : "text-slate-400 hover:text-slate-200"
+              className={`px-3 py-1.5 rounded-lg text-xs md:text-sm font-medium transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                activeTab === "progress"
+                  ? "bg-violet-50 dark:bg-violet-500/15 text-violet-700 dark:text-violet-300 font-semibold"
+                  : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-100/70 dark:hover:bg-white/[0.04]"
               }`}
             >
               Progress
             </button>
 
-          </div>
+          </nav>
+
+          <ThemeToggle compact />
         </div>
       </div>
+
+      {/* Non-blocking RAG Ingestion Progress Bar (only while indexing or on error) */}
+      {file.ragStage && file.ragStage !== "ready" && (
+        <div
+          className={`px-5 md:px-7 py-2 border-b text-xs flex items-center justify-between gap-4 shrink-0 ${
+            file.ragStage === "error"
+              ? "bg-rose-50 dark:bg-rose-950/30 border-rose-200 dark:border-rose-500/30 text-rose-700 dark:text-rose-300"
+              : "bg-violet-50/70 dark:bg-violet-950/20 border-violet-200/70 dark:border-violet-500/20 text-violet-700 dark:text-violet-300"
+          }`}
+          id="rag-ingestion-banner"
+        >
+          <div className="flex items-center gap-2.5 min-w-0">
+            {file.ragStage === "error" ? (
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+            ) : (
+              <RefreshCw className="w-3.5 h-3.5 shrink-0 animate-spin" />
+            )}
+            <span className="font-semibold capitalize shrink-0">{file.ragStage}:</span>
+            <span className="truncate">
+              {file.ragStage === "error"
+                ? file.ragError || "Document indexing encountered an error."
+                : file.ragMessage || "Indexing document sections and embeddings..."}
+            </span>
+          </div>
+          {file.ragStage !== "error" && (
+            <div className="flex items-center gap-2.5 shrink-0">
+              <div className="w-24 h-1.5 rounded-full bg-violet-200/70 dark:bg-white/10 overflow-hidden">
+                <div
+                  className="h-full bg-violet-600 dark:bg-violet-400 transition-all duration-300"
+                  style={{ width: `${Math.max(8, Math.min(100, file.ragProgress ?? 15))}%` }}
+                />
+              </div>
+              <span className="font-mono text-[11px] font-semibold tabular-nums">
+                {file.ragProgress ?? 15}%
+              </span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Primary Workspace Scroll Area */}
       <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6 flex flex-col justify-between" id="arena-main-scroll">
@@ -1512,33 +1638,64 @@ export default function FeynmanArena({
               id="explain-box-container"
             >
               
-              {/* Target Prompt Box (Horizontal Thin rounded layout) */}
-              <div 
-                className="w-full rounded-xl border border-[#14143a] bg-[#050519]/40 p-4 flex items-center justify-between" 
-                id="audience-prompt-box"
-              >
-                <div className="flex items-center space-x-3 w-full pr-4" id="target-audience">
-                  <BrainCircuit className="w-4 h-4 text-purple-400 shrink-0" />
-                  <input
-                    type="text"
-                    id="input-prompt-guide"
-                    value={promptGuide}
-                    onChange={(e) => setPromptGuide(e.target.value)}
-                    className="bg-transparent text-slate-300 text-xs md:text-sm font-medium focus:outline-none w-full placeholder-slate-600"
-                    placeholder="Enter target explanation audience..."
-                  />
+              {/* Target Prompt Box + Concept Selector */}
+              <div className="space-y-3">
+                <div 
+                  className="w-full rounded-xl border border-slate-200/90 dark:border-white/[0.08] bg-white dark:bg-[#0E0E1D] px-4 py-3 flex items-center justify-between shadow-xs" 
+                  id="audience-prompt-box"
+                >
+                  <div className="flex items-center space-x-3 w-full pr-4" id="target-audience">
+                    <BrainCircuit className="w-4 h-4 text-violet-600 dark:text-violet-400 shrink-0" />
+                    <input
+                      type="text"
+                      id="input-prompt-guide"
+                      value={promptGuide}
+                      onChange={(e) => setPromptGuide(e.target.value)}
+                      className="bg-transparent text-slate-800 dark:text-slate-200 text-xs md:text-sm font-medium focus:outline-none w-full placeholder-slate-400 dark:placeholder-slate-500"
+                      placeholder="Enter target explanation audience..."
+                    />
+                  </div>
+                  <span className="text-[10px] font-mono font-semibold text-violet-600 dark:text-violet-400 uppercase tracking-widest hidden md:inline whitespace-nowrap shrink-0">
+                    Feynman Persona
+                  </span>
                 </div>
-                <span className="text-[10px] font-mono font-medium text-purple-400/80 uppercase tracking-widest hidden md:inline">
-                  Feynman Persona
-                </span>
+
+                {concepts.length > 0 && (
+                  <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-0.5">
+                    <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400 whitespace-nowrap shrink-0">
+                      Topic focus:
+                    </span>
+                    {concepts.map((c) => {
+                      const isActive = selectedConcept?.id === c.id;
+                      const isGraded = !!scoreCards[c.title];
+                      return (
+                        <button
+                          key={c.id}
+                          type="button"
+                          onClick={() => setSelectedConcept(c)}
+                          className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-all cursor-pointer whitespace-nowrap shrink-0 border ${
+                            isActive
+                              ? "bg-violet-600 text-white border-violet-600 shadow-xs"
+                              : "bg-white dark:bg-white/[0.04] text-slate-600 dark:text-slate-300 border-slate-200 dark:border-white/10 hover:border-violet-300 dark:hover:border-violet-500/40"
+                          }`}
+                        >
+                          <span>{c.title}</span>
+                          {isGraded && (
+                            <Check className={`w-3 h-3 ${isActive ? "text-emerald-200" : "text-emerald-600 dark:text-emerald-400"}`} />
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
               {/* Saved Explanation Blocks Timeline (Shows sequentially under typed text) */}
               {explanationBlocks.length > 0 && (
-                <div className="flex flex-col space-y-3 p-4 rounded-2xl border border-purple-500/10 bg-[#090924]/30" id="explanation-blocks-timeline">
-                  <div className="flex items-center justify-between text-[11px] uppercase tracking-wider font-bold text-purple-400">
+                <div className="flex flex-col space-y-3 p-4 rounded-2xl border border-slate-200/90 dark:border-white/[0.08] bg-white dark:bg-[#0E0E1D] shadow-xs" id="explanation-blocks-timeline">
+                  <div className="flex items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-200">
                     <span className="flex items-center gap-2">
-                      <CheckCircle2 className="w-3.5 h-3.5 text-purple-400" />
+                      <CheckCircle2 className="w-4 h-4 text-violet-600 dark:text-violet-400" />
                       Explanation Segments ({explanationBlocks.length})
                     </span>
                     <button
@@ -1556,31 +1713,31 @@ export default function FeynmanArena({
                         }
                         setExplanationBlocks([]);
                       }}
-                      className="text-[10px] text-zinc-550 hover:text-red-400 transition-colors cursor-pointer select-none"
+                      className="text-xs text-slate-500 dark:text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 transition-colors cursor-pointer select-none"
                     >
                       Clear all segments
                     </button>
                   </div>
                   
-                  <div className="flex flex-col space-y-3 max-h-[280px] overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-purple-900/40">
+                  <div className="flex flex-col space-y-3 max-h-[280px] overflow-y-auto pr-1">
                     {explanationBlocks.map((block) => (
                       <div 
                         key={block.id}
-                        className={`flex items-start justify-between p-4 rounded-xl border transition-all duration-300 relative group/block ${
+                        className={`flex items-start justify-between p-4 rounded-xl border transition-all duration-200 relative group/block ${
                           block.type === "voice" 
-                            ? "bg-red-950/10 border-red-500/15 hover:border-red-500/30" 
+                            ? "bg-rose-50/60 dark:bg-rose-950/15 border-rose-200/80 dark:border-rose-500/20" 
                             : block.type === "drawing"
-                              ? "bg-[#04091a] border-cyan-500/15 hover:border-cyan-500/30 shadow-sm"
-                              : "bg-[#050519]/60 border-[#14143a] hover:border-purple-500/20"
+                              ? "bg-sky-50/60 dark:bg-[#081022] border-sky-200/80 dark:border-cyan-500/20"
+                              : "bg-slate-50/80 dark:bg-white/[0.03] border-slate-200/80 dark:border-white/[0.08]"
                         }`}
                       >
                         <div className="flex items-start space-x-3 w-full pr-8">
                           <div className={`mt-0.5 p-2 rounded-lg shrink-0 ${
                             block.type === "voice" 
-                              ? "bg-red-500/10 text-red-400" 
+                              ? "bg-rose-100 dark:bg-rose-500/15 text-rose-600 dark:text-rose-400" 
                               : block.type === "drawing"
-                                ? "bg-cyan-500/10 text-cyan-400"
-                                : "bg-purple-500/10 text-[#d946ef]"
+                                ? "bg-sky-100 dark:bg-cyan-500/15 text-sky-600 dark:text-cyan-400"
+                                : "bg-violet-100 dark:bg-violet-500/15 text-violet-600 dark:text-violet-400"
                           }`}>
                             {block.type === "voice" ? (
                               <Mic className="w-4 h-4" />
@@ -1593,21 +1750,21 @@ export default function FeynmanArena({
                           
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center space-x-2 mb-1.5 flex-wrap gap-y-1">
-                              <span className={`text-[10px] uppercase tracking-wider font-bold ${
+                              <span className={`text-[11px] uppercase tracking-wider font-semibold ${
                                 block.type === "voice" 
-                                  ? "text-red-400" 
+                                  ? "text-rose-700 dark:text-rose-400" 
                                   : block.type === "drawing"
-                                    ? "text-cyan-400"
-                                    : "text-purple-400"
+                                    ? "text-sky-700 dark:text-cyan-400"
+                                    : "text-violet-700 dark:text-violet-400"
                               }`}>
                                 {block.type === "voice" ? "Voice Note" : block.type === "drawing" ? "Whiteboard Diagram" : "Written Note"}
                               </span>
-                              <span className="text-slate-600 text-[10px]">•</span>
-                              <span className="text-slate-500 font-mono text-[9px]">{block.timestamp}</span>
+                              <span className="text-slate-400 dark:text-slate-600 text-[10px]">·</span>
+                              <span className="text-slate-500 font-mono text-[11px] tabular-nums">{block.timestamp}</span>
                               {block.type === "voice" && block.duration !== undefined && (
                                 <>
-                                  <span className="text-slate-600 text-[10px]">•</span>
-                                  <span className="bg-red-500/10 border border-red-500/20 text-red-300 text-[9px] font-mono font-semibold px-1.5 py-0.5 rounded">
+                                  <span className="text-slate-400 dark:text-slate-600 text-[10px]">·</span>
+                                  <span className="text-rose-700 dark:text-rose-300 text-[11px] font-mono font-semibold tabular-nums">
                                     {Math.floor(block.duration / 60)}:{(block.duration % 60).toString().padStart(2, "0")}
                                   </span>
                                 </>
@@ -1615,9 +1772,9 @@ export default function FeynmanArena({
                             </div>
 
                             {block.type === "voice" ? (
-                              <div className="space-y-3">
+                              <div className="space-y-2.5">
                                 {/* Visual Audio Waveform block */}
-                                <div className="flex items-center space-x-4 bg-red-950/20 border border-red-500/20 rounded-xl p-3 w-full max-w-xs sm:max-w-md">
+                                <div className="flex items-center space-x-3.5 bg-white dark:bg-rose-950/25 border border-rose-200 dark:border-rose-500/25 rounded-xl p-3 w-full max-w-xs sm:max-w-md">
                                   <button
                                     onClick={() => {
                                       if (currentlyPlayingBlockId === block.id) {
@@ -1708,21 +1865,21 @@ export default function FeynmanArena({
                                         }
                                       }
                                     }}
-                                    className="w-10 h-10 rounded-full bg-red-500/20 hover:bg-red-500 text-red-200 hover:text-white transition-all duration-200 flex items-center justify-center shrink-0 cursor-pointer shadow-md border border-red-500/30"
+                                    className="w-9 h-9 rounded-full bg-rose-100 dark:bg-rose-500/20 hover:bg-rose-600 text-rose-700 dark:text-rose-200 hover:text-white transition-all duration-200 flex items-center justify-center shrink-0 cursor-pointer border border-rose-200 dark:border-rose-500/30"
                                     title={currentlyPlayingBlockId === block.id ? "Stop Listening" : "Listen to audio message playback"}
                                   >
                                     {currentlyPlayingBlockId === block.id ? (
-                                      <Square className="w-4 h-4 text-red-100" />
+                                      <Square className="w-3.5 h-3.5" />
                                     ) : (
-                                      <Play className="w-4 h-4 text-red-100 ml-0.5" />
+                                      <Play className="w-3.5 h-3.5 ml-0.5" />
                                     )}
                                   </button>
                                   
                                   <div className="flex-1 flex flex-col justify-center min-w-0">
-                                    <div className="text-[10px] font-bold uppercase tracking-wider text-red-400/80 mb-1">
-                                      {block.audioUrl ? "Original Voice Recording" : "AI Voice Fallback"}
+                                    <div className="text-[10px] font-semibold uppercase tracking-wider text-rose-700 dark:text-rose-400 mb-1">
+                                      {block.audioUrl ? "Original Voice Recording" : "Voice Transcript Playback"}
                                     </div>
-                                    <div className="flex items-center space-x-[2px] h-6 flex-1">
+                                    <div className="flex items-center space-x-[2px] h-5 flex-1">
                                       {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20].map((idx) => {
                                         const baseHeight = 30 + Math.sin(idx * 0.5) * 20 + (idx % 3) * 10;
                                         return (
@@ -1730,8 +1887,8 @@ export default function FeynmanArena({
                                             key={idx} 
                                             className={`w-[2.5px] rounded-full transition-all duration-300 ${
                                               currentlyPlayingBlockId === block.id 
-                                                ? "bg-red-400 h-[80%] animate-pulse" 
-                                                : "bg-red-500/30"
+                                                ? "bg-rose-500 h-[80%] animate-pulse" 
+                                                : "bg-rose-300 dark:bg-rose-500/35"
                                             }`}
                                             style={{ 
                                               height: currentlyPlayingBlockId === block.id ? undefined : `${baseHeight}%`
@@ -1744,7 +1901,7 @@ export default function FeynmanArena({
                                 </div>
                                 
                                 {/* Transcript content */}
-                                <p className="text-slate-300 text-xs md:text-sm italic pl-2.5 border-l-2 border-red-500/30 leading-relaxed font-medium">
+                                <p className="text-slate-700 dark:text-slate-300 text-xs md:text-sm italic leading-relaxed font-medium">
                                   "{block.content}"
                                 </p>
                               </div>
@@ -1754,10 +1911,10 @@ export default function FeynmanArena({
                                   (() => {
                                     const box = getStrokesBoundingBox(block.strokes);
                                     return (
-                                      <div className="bg-[#02020a]/80 p-2.5 rounded-lg border border-[#1b1b36] mt-1 hover:border-cyan-500/10 transition-colors w-full max-w-lg overflow-hidden">
+                                      <div className="bg-white dark:bg-[#080814] p-2.5 rounded-lg border border-slate-200 dark:border-white/[0.08] mt-1 w-full max-w-lg overflow-hidden">
                                         <svg 
                                           viewBox={`${box.x} ${box.y} ${box.width} ${box.height}`}
-                                          className="w-full max-h-[160px] h-auto object-contain text-cyan-400"
+                                          className="w-full max-h-[160px] h-auto object-contain"
                                         >
                                           {block.strokes.map((stroke, sIdx) => {
                                             if (!stroke.points || stroke.points.length === 0) return null;
@@ -1792,11 +1949,11 @@ export default function FeynmanArena({
                                     );
                                   })()
                                 ) : (
-                                  <p className="text-slate-500 text-xs italic">Blank chalkboard drawing</p>
+                                  <p className="text-slate-500 text-xs italic">Blank whiteboard drawing</p>
                                 )}
                               </div>
                             ) : (
-                              <p className="text-slate-200 text-xs md:text-sm leading-relaxed whitespace-pre-wrap pl-2 border-l-2 border-purple-500/30">
+                              <p className="text-slate-700 dark:text-slate-200 text-xs md:text-sm leading-relaxed whitespace-pre-wrap">
                                 {block.content}
                               </p>
                             )}
@@ -1814,7 +1971,7 @@ export default function FeynmanArena({
                             }
                             setExplanationBlocks(prev => prev.filter(b => b.id !== block.id));
                           }}
-                          className="p-1 text-slate-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg absolute right-3 top-3 opacity-0 group-hover/block:opacity-100 transition-opacity cursor-pointer focus:opacity-100"
+                          className="p-1 text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-500/10 rounded-lg absolute right-3 top-3 opacity-0 group-hover/block:opacity-100 transition-opacity cursor-pointer focus:opacity-100"
                           title="Delete Segment"
                         >
                           <X className="w-3.5 h-3.5" />
@@ -1825,22 +1982,16 @@ export default function FeynmanArena({
                 </div>
               )}
 
-              {/* Huge Text Explanation Canvas Box */}
+              {/* Text Explanation Canvas Box */}
               <div 
-                className="flex-1 rounded-2xl border border-[#161642]/80 bg-[#040416]/50 flex flex-col justify-between p-6 relative group min-h-[380px]" 
+                className="flex-1 rounded-2xl border border-slate-200/90 dark:border-white/[0.08] bg-white dark:bg-[#0E0E1D] flex flex-col justify-between p-6 relative group min-h-[380px] shadow-xs" 
                 id="explanation-canvas-container"
               >
-                {/* Decorative corners */}
-                <div className="absolute top-3 left-3 w-2 h-2 border-t border-l border-purple-500/10 group-focus-within:border-purple-500/40" />
-                <div className="absolute top-3 right-3 w-2 h-2 border-t border-r border-[#d946ef]/10 group-focus-within:border-[#d946ef]/30" />
-                <div className="absolute bottom-3 left-3 w-2 h-2 border-b border-l border-purple-500/10 group-focus-within:border-purple-500/40" />
-                <div className="absolute bottom-3 right-3 w-2 h-2 border-b border-r border-purple-500/10 group-focus-within:border-purple-500/40" />
-
                 {isGrading ? (
                   <div className="flex-1 flex flex-col items-center justify-center space-y-4" id="grading-spinner">
-                    <div className="w-10 h-10 border-4 border-purple-500 border-t-transparent rounded-full animate-spin" />
-                    <h3 className="text-sm font-semibold text-purple-200">Analyzing explanation...</h3>
-                    <p className="text-xs text-slate-500">Checking simplicity metrics and semantic gaps</p>
+                    <div className="w-10 h-10 border-4 border-violet-600 dark:border-violet-400 border-t-transparent rounded-full animate-spin" />
+                    <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">Analyzing explanation...</h3>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">Checking simplicity metrics and semantic gaps</p>
                   </div>
                 ) : (
                   <>
@@ -1861,26 +2012,25 @@ export default function FeynmanArena({
                       />
                     )}
 
-                    {/* Highly aesthetic floating Whiteboard Toolbar */}
+                    {/* Floating Whiteboard Toolbar */}
                     {isDrawingOpen && (
                       <div 
-                        className="absolute top-4 right-4 z-20 flex flex-wrap items-center gap-2 bg-[#06061e]/90 border border-purple-500/30 backdrop-blur-md px-3 py-1.5 rounded-xl shadow-lg select-none"
+                        className="absolute top-4 right-4 z-20 flex flex-wrap items-center gap-2 bg-white/95 dark:bg-[#0E0E1D]/95 border border-slate-200 dark:border-white/10 backdrop-blur-md px-3 py-1.5 rounded-xl shadow-md select-none"
                         id="whiteboard-floating-toolbar"
                       >
-                        {/* Title marker for teacher role */}
-                        <span className="text-[9px] font-bold uppercase tracking-wider text-purple-400 px-1 hidden sm:inline">
-                          Teacher Marker
+                        <span className="text-[10px] font-semibold uppercase tracking-wider text-violet-600 dark:text-violet-400 px-1 hidden sm:inline">
+                          Whiteboard
                         </span>
 
                         {/* Mode Selectors */}
-                        <div className="flex bg-slate-950/60 p-1 rounded-lg border border-slate-900/50 gap-1 shrink-0">
+                        <div className="flex bg-slate-100 dark:bg-white/[0.05] p-0.5 rounded-lg border border-slate-200/80 dark:border-white/[0.07] gap-1 shrink-0">
                           <button
                             type="button"
                             onClick={() => setDrawingMode("type")}
-                            className={`px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                            className={`px-2 py-1 rounded text-[11px] font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
                               drawingMode === "type" 
-                                ? "bg-purple-500/20 text-purple-200 border border-purple-500/30" 
-                                : "text-slate-400 hover:text-slate-200"
+                                ? "bg-white dark:bg-violet-500/20 text-violet-700 dark:text-violet-200 shadow-xs" 
+                                : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
                             }`}
                             title="Keyboard Type (Cursor is free to type text beneath drawings)"
                           >
@@ -1891,10 +2041,10 @@ export default function FeynmanArena({
                           <button
                             type="button"
                             onClick={() => setDrawingMode("pen")}
-                            className={`px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                            className={`px-2 py-1 rounded text-[11px] font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
                               drawingMode === "pen" 
-                                ? "bg-purple-500/25 text-purple-100 border border-purple-500/40" 
-                                : "text-slate-400 hover:text-slate-200"
+                                ? "bg-white dark:bg-violet-500/25 text-violet-700 dark:text-violet-200 shadow-xs" 
+                                : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
                             }`}
                             title="Pen Sketch (Draw freehand over your texts)"
                           >
@@ -1905,10 +2055,10 @@ export default function FeynmanArena({
                           <button
                             type="button"
                             onClick={() => setDrawingMode("eraser")}
-                            className={`px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                            className={`px-2 py-1 rounded text-[11px] font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
                               drawingMode === "eraser" 
-                                ? "bg-purple-500/20 text-purple-200 border border-purple-500/30" 
-                                : "text-slate-400 hover:text-slate-200"
+                                ? "bg-white dark:bg-violet-500/20 text-violet-700 dark:text-violet-200 shadow-xs" 
+                                : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
                             }`}
                             title="Eraser tool"
                           >
@@ -1920,24 +2070,24 @@ export default function FeynmanArena({
                         {/* Color preset selection */}
                         {drawingMode === "pen" && (
                           <>
-                            <span className="text-slate-800 font-mono hidden sm:inline">|</span>
+                            <span className="text-slate-300 dark:text-slate-700 hidden sm:inline">|</span>
                             <div className="flex items-center gap-1.5 px-1 shrink-0">
                               {[
-                                { hex: "#d946ef", label: "Neon Purple" },
-                                { hex: "#06b6d4", label: "Magic Cyan" },
-                                { hex: "#10b981", label: "Emerald Green" },
-                                { hex: "#ef4444", label: "Alert Red" }
+                                { hex: "#d946ef", label: "Violet Marker" },
+                                { hex: "#06b6d4", label: "Cyan Marker" },
+                                { hex: "#10b981", label: "Emerald Marker" },
+                                { hex: "#ef4444", label: "Coral Marker" }
                               ].map((item) => (
                                 <button
                                   key={item.hex}
                                   type="button"
                                   onClick={() => setBrushColor(item.hex)}
-                                  className="w-4 h-4 rounded-full border border-white/10 transition-transform hover:scale-120 cursor-pointer relative flex items-center justify-center shrink-0"
+                                  className="w-4 h-4 rounded-full border border-slate-300 dark:border-white/20 transition-transform hover:scale-110 cursor-pointer relative flex items-center justify-center shrink-0"
                                   style={{ backgroundColor: item.hex }}
                                   title={item.label}
                                 >
                                   {brushColor === item.hex && (
-                                    <span className="absolute w-1.5 h-1.5 bg-white rounded-full" />
+                                    <span className="w-1.5 h-1.5 bg-white rounded-full shadow-xs" />
                                   )}
                                 </button>
                               ))}
@@ -1948,8 +2098,8 @@ export default function FeynmanArena({
                         {/* Brush Width Selector */}
                         {drawingMode === "pen" && (
                           <>
-                            <span className="text-slate-800 font-mono hidden sm:inline">|</span>
-                            <div className="flex bg-slate-950/60 p-1 rounded-lg gap-1 border border-slate-900 shrink-0">
+                            <span className="text-slate-300 dark:text-slate-700 hidden sm:inline">|</span>
+                            <div className="flex bg-slate-100 dark:bg-white/[0.05] p-0.5 rounded-lg gap-0.5 border border-slate-200/80 dark:border-white/[0.07] shrink-0">
                               {[
                                 { size: 2, label: "Thin" },
                                 { size: 4, label: "Mid" },
@@ -1959,10 +2109,10 @@ export default function FeynmanArena({
                                   key={pixelSize.size}
                                   type="button"
                                   onClick={() => setBrushWidth(pixelSize.size)}
-                                  className={`px-1.5 py-0.5 rounded text-[8px] font-bold transition-all cursor-pointer ${
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-semibold transition-all cursor-pointer ${
                                     brushWidth === pixelSize.size 
-                                      ? "bg-purple-900/45 text-purple-300" 
-                                      : "text-slate-500 hover:text-slate-400"
+                                      ? "bg-white dark:bg-violet-500/25 text-violet-700 dark:text-violet-200 shadow-xs" 
+                                      : "text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200"
                                   }`}
                                   title={`${pixelSize.label} brush stroke width`}
                                 >
@@ -1973,7 +2123,7 @@ export default function FeynmanArena({
                           </>
                         )}
 
-                        <span className="text-slate-800 font-mono">|</span>
+                        <span className="text-slate-300 dark:text-slate-700">|</span>
 
                         {/* Quick Undo and Wipes */}
                         <div className="flex items-center gap-1 shrink-0">
@@ -1981,7 +2131,7 @@ export default function FeynmanArena({
                             type="button"
                             onClick={handleUndoStroke}
                             disabled={strokes.length === 0}
-                            className="p-1 px-1.5 rounded bg-slate-900/30 hover:bg-slate-900 text-slate-450 hover:text-white disabled:opacity-20 disabled:pointer-events-none transition-colors cursor-pointer"
+                            className="p-1.5 rounded-md bg-slate-100 dark:bg-white/[0.05] hover:bg-slate-200 dark:hover:bg-white/10 text-slate-600 dark:text-slate-300 disabled:opacity-30 disabled:pointer-events-none transition-colors cursor-pointer"
                             title="Undo drawing stroke"
                           >
                             <RotateCcw className="w-3 h-3" />
@@ -1991,7 +2141,7 @@ export default function FeynmanArena({
                             type="button"
                             onClick={clearCanvas}
                             disabled={strokes.length === 0}
-                            className="p-1 px-1.5 rounded bg-slate-900/30 hover:bg-red-950/20 text-slate-450 hover:text-red-400 disabled:opacity-20 disabled:pointer-events-none transition-colors cursor-pointer"
+                            className="p-1.5 rounded-md bg-slate-100 dark:bg-white/[0.05] hover:bg-rose-50 dark:hover:bg-rose-950/30 text-slate-600 dark:text-slate-300 hover:text-rose-600 dark:hover:text-rose-400 disabled:opacity-30 disabled:pointer-events-none transition-colors cursor-pointer"
                             title="Wipe whiteboard markings clean"
                           >
                             <Trash2 className="w-3 h-3" />
@@ -2001,7 +2151,7 @@ export default function FeynmanArena({
                             type="button"
                             onClick={handleStoreDrawingBlock}
                             disabled={strokes.length === 0}
-                            className="bg-cyan-500/20 hover:bg-cyan-500/35 border border-cyan-500/40 text-cyan-200 hover:text-white disabled:opacity-20 disabled:pointer-events-none px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1.5 transition-all cursor-pointer select-none"
+                            className="bg-sky-50 dark:bg-cyan-500/15 hover:bg-sky-100 dark:hover:bg-cyan-500/25 border border-sky-200 dark:border-cyan-500/30 text-sky-700 dark:text-cyan-200 disabled:opacity-30 disabled:pointer-events-none px-2.5 py-1 rounded-md text-[11px] font-semibold flex items-center gap-1 transition-all cursor-pointer select-none whitespace-nowrap"
                             title="Save whiteboard drawing to permanent segments"
                           >
                             <span>+ Save Drawing</span>
@@ -2013,7 +2163,7 @@ export default function FeynmanArena({
                               setIsDrawingOpen(false);
                               setDrawingMode("type");
                             }}
-                            className="p-1 px-1.5 rounded bg-slate-900/30 hover:bg-slate-900 text-slate-450 hover:text-white transition-colors cursor-pointer"
+                            className="p-1.5 rounded-md bg-slate-100 dark:bg-white/[0.05] hover:bg-slate-200 dark:hover:bg-white/10 text-slate-600 dark:text-slate-300 transition-colors cursor-pointer"
                             title="Collapse whiteboards"
                           >
                             <X className="w-3 h-3" />
@@ -2026,40 +2176,40 @@ export default function FeynmanArena({
                       id="text-explanation"
                       value={explanationText}
                       onChange={(e) => setExplanationText(e.target.value)}
-                      placeholder={isDrawingOpen || strokes.length > 0 || explanationBlocks.some(b => b.type === "drawing") ? "" : "Start explaining the concept in your own words. Click Draw to open interactive whiteboard overlays, switch to Paint-style markers, or select Type to type text beneath your drawings..."}
-                      className="w-full flex-1 bg-transparent text-slate-100 placeholder-slate-600 text-sm md:text-base leading-relaxed focus:outline-none resize-none min-h-[300px] pt-14"
+                      placeholder={isDrawingOpen || strokes.length > 0 || explanationBlocks.some(b => b.type === "drawing") ? "" : "Start explaining the concept in your own words. Click Draw to open the whiteboard overlay, or Voice to speak your explanation..."}
+                      className="w-full flex-1 bg-transparent text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 text-sm md:text-base leading-relaxed focus:outline-none resize-none min-h-[300px] pt-12"
                     />
 
-                    {/* Integrated Voice and Draw popup bars over input if active */}
+                    {/* Integrated Voice active bar */}
                     <AnimatePresence>
                       {isVoiceActive && (
                         <motion.div
                           initial={{ opacity: 0, y: 10 }}
                           animate={{ opacity: 1, y: 0 }}
                           exit={{ opacity: 0, y: 10 }}
-                          className="mb-4 p-3.5 bg-red-950/15 border border-red-500/30 rounded-xl flex items-center justify-between shadow-[0_0_15px_rgba(239,68,68,0.08)]"
+                          className="mb-4 p-3.5 bg-rose-50 dark:bg-rose-950/20 border border-rose-200 dark:border-rose-500/30 rounded-xl flex items-center justify-between"
                           id="voice-active-bar"
                         >
                           <div className="flex items-center space-x-3">
                             <span className="relative flex h-3 w-3">
-                              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
-                              <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
+                              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
+                              <span className="relative inline-flex rounded-full h-3 w-3 bg-rose-500"></span>
                             </span>
                             <div className="flex flex-col">
-                              <span className="text-xs text-red-200 font-semibold flex items-center gap-2">
+                              <span className="text-xs text-rose-800 dark:text-rose-200 font-semibold flex items-center gap-2">
                                 Listening... Speak clearly
                                 <span className="flex items-center gap-[1.5px] h-3">
-                                  <span className="w-[1.5px] h-1.5 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '0ms', animationDuration: '0.6s' }} />
-                                  <span className="w-[1.5px] h-3 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '150ms', animationDuration: '0.6s' }} />
-                                  <span className="w-[1.5px] h-1 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '300ms', animationDuration: '0.6s' }} />
-                                  <span className="w-[1.5px] h-2 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '450ms', animationDuration: '0.6s' }} />
+                                  <span className="w-[1.5px] h-1.5 bg-rose-500 rounded-full animate-bounce" style={{ animationDelay: '0ms', animationDuration: '0.6s' }} />
+                                  <span className="w-[1.5px] h-3 bg-rose-500 rounded-full animate-bounce" style={{ animationDelay: '150ms', animationDuration: '0.6s' }} />
+                                  <span className="w-[1.5px] h-1 bg-rose-500 rounded-full animate-bounce" style={{ animationDelay: '300ms', animationDuration: '0.6s' }} />
+                                  <span className="w-[1.5px] h-2 bg-rose-500 rounded-full animate-bounce" style={{ animationDelay: '450ms', animationDuration: '0.6s' }} />
                                 </span>
                               </span>
-                              <span className="text-[10px] text-slate-450 font-mono">
-                                Speaking duration: {Math.floor(voiceDuration / 60)}:{(voiceDuration % 60).toString().padStart(2, "0")} (Speech-to-Text active)
+                              <span className="text-[11px] text-rose-600/80 dark:text-slate-400 font-mono tabular-nums">
+                                Duration: {Math.floor(voiceDuration / 60)}:{(voiceDuration % 60).toString().padStart(2, "0")}
                               </span>
                               {voiceTranscript && (
-                                <p className="text-xs text-red-300/90 italic mt-1 max-w-xs sm:max-w-md line-clamp-2 border-l border-red-500/30 pl-1.5">
+                                <p className="text-xs text-rose-700 dark:text-rose-300/90 italic mt-1 max-w-xs sm:max-w-md line-clamp-2">
                                   "{voiceTranscript}"
                                 </p>
                               )}
@@ -2068,7 +2218,7 @@ export default function FeynmanArena({
                           <button
                             id="btn-voice-stop"
                             onClick={startVoiceRecording}
-                            className="bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/40 rounded-lg px-3.5 py-1.5 text-xs font-semibold hover:text-white transition-all cursor-pointer"
+                            className="bg-rose-600 hover:bg-rose-700 text-white rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-all cursor-pointer whitespace-nowrap"
                           >
                             Finish
                           </button>
@@ -2076,31 +2226,47 @@ export default function FeynmanArena({
                       )}
                     </AnimatePresence>
 
+                    {gradingError && (
+                      <div className="mb-3 px-4 py-2.5 rounded-xl bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-500/30 text-rose-700 dark:text-rose-300 text-xs flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                          <span>{gradingError}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setGradingError(null)}
+                          className="text-rose-500 hover:text-rose-700 dark:hover:text-rose-200 cursor-pointer shrink-0"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    )}
+
                     {/* Action Bar inside textarea box */}
-                    <div className="flex items-center justify-between border-t border-[#12122b]/60 pt-4 mt-2 shrink-0" id="explanation-canvas-actions">
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200/80 dark:border-white/[0.07] pt-4 mt-2 shrink-0" id="explanation-canvas-actions">
                       {/* Left: Input helper triggers */}
-                      <div className="flex items-center space-x-3" id="helper-triggers-left">
+                      <div className="flex items-center gap-2 flex-wrap" id="helper-triggers-left">
                         
                         {/* Voice button */}
                         <button
                           id="btn-trigger-voice"
                           onClick={startVoiceRecording}
                           type="button"
-                          className={`flex items-center space-x-1.5 py-1.5 px-3 rounded-lg text-xs font-semibold transition-all duration-300 cursor-pointer ${
+                          className={`flex items-center space-x-1.5 py-1.5 px-3 rounded-lg text-xs font-semibold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
                             isVoiceActive 
-                              ? "bg-red-500/15 text-red-400 border border-red-500/40 shadow-[0_0_12px_rgba(239,68,68,0.2)]" 
-                              : "text-slate-450 hover:text-slate-200 hover:bg-slate-900/40 border border-transparent"
+                              ? "bg-rose-50 dark:bg-rose-500/15 text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-500/40" 
+                              : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-white/[0.05] border border-transparent"
                           }`}
                         >
-                          <Mic className={`w-4 h-4 ${isVoiceActive ? "text-red-500 animate-pulse" : "text-slate-450"}`} />
+                          <Mic className={`w-4 h-4 ${isVoiceActive ? "text-rose-500 animate-pulse" : ""}`} />
                           <span className="flex items-center gap-1.5">
                             {isVoiceActive ? "Listening..." : "Voice"}
                             {isVoiceActive && (
                               <span className="flex items-center gap-[1.5px] h-3 ml-0.5">
-                                <span className="w-[1.5px] h-1.5 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '0ms', animationDuration: '0.6s' }} />
-                                <span className="w-[1.5px] h-2.5 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '150ms', animationDuration: '0.6s' }} />
-                                <span className="w-[1.5px] h-1 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '300ms', animationDuration: '0.6s' }} />
-                                <span className="w-[1.5px] h-2 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '450ms', animationDuration: '0.6s' }} />
+                                <span className="w-[1.5px] h-1.5 bg-rose-500 rounded-full animate-bounce" style={{ animationDelay: '0ms', animationDuration: '0.6s' }} />
+                                <span className="w-[1.5px] h-2.5 bg-rose-500 rounded-full animate-bounce" style={{ animationDelay: '150ms', animationDuration: '0.6s' }} />
+                                <span className="w-[1.5px] h-1 bg-rose-500 rounded-full animate-bounce" style={{ animationDelay: '300ms', animationDuration: '0.6s' }} />
+                                <span className="w-[1.5px] h-2 bg-rose-500 rounded-full animate-bounce" style={{ animationDelay: '450ms', animationDuration: '0.6s' }} />
                               </span>
                             )}
                           </span>
@@ -2115,13 +2281,13 @@ export default function FeynmanArena({
                             setDrawingMode(nextState ? "pen" : "type");
                           }}
                           type="button"
-                          className={`flex items-center space-x-1.5 py-1.5 px-3 rounded-lg text-xs font-medium transition-all cursor-pointer ${
+                          className={`flex items-center space-x-1.5 py-1.5 px-3 rounded-lg text-xs font-semibold transition-all cursor-pointer whitespace-nowrap shrink-0 ${
                             isDrawingOpen 
-                              ? "bg-purple-950/40 text-purple-300 border border-purple-500/30" 
-                              : "text-slate-450 hover:text-slate-200 hover:bg-slate-900/40"
+                              ? "bg-violet-50 dark:bg-violet-500/15 text-violet-700 dark:text-violet-300 border border-violet-200 dark:border-violet-500/30" 
+                              : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-white/[0.05] border border-transparent"
                           }`}
                         >
-                          <Pencil className="w-4 h-4 text-slate-450" />
+                          <Pencil className="w-4 h-4" />
                           <span>Draw</span>
                         </button>
 
@@ -2130,7 +2296,7 @@ export default function FeynmanArena({
                             id="btn-store-drawing"
                             onClick={handleStoreDrawingBlock}
                             type="button"
-                            className="flex items-center space-x-1 py-1.5 px-3 bg-[#06b6d4]/10 border border-[#06b6d4]/30 text-cyan-300 hover:text-white hover:bg-[#06b6d4]/20 rounded-lg text-xs font-semibold cursor-pointer select-none transition-all duration-200 animate-pulse-subtle"
+                            className="flex items-center space-x-1 py-1.5 px-3 bg-sky-50 dark:bg-cyan-500/10 border border-sky-200 dark:border-cyan-500/30 text-sky-700 dark:text-cyan-300 hover:bg-sky-100 dark:hover:bg-cyan-500/20 rounded-lg text-xs font-semibold cursor-pointer select-none transition-all whitespace-nowrap shrink-0"
                             title="Save the active whiteboard sketch as a dynamic segment block"
                           >
                             <span>+ Save Drawing</span>
@@ -2143,7 +2309,7 @@ export default function FeynmanArena({
                             id="btn-store-written-block"
                             onClick={handleStoreTextBlock}
                             type="button"
-                            className="flex items-center space-x-1 py-1 px-2 bg-purple-500/15 border border-purple-500/30 text-purple-300 hover:text-white hover:bg-purple-500/25 rounded-lg text-xs font-semibold cursor-pointer select-none transition-all duration-200"
+                            className="flex items-center space-x-1 py-1.5 px-3 bg-violet-50 dark:bg-violet-500/15 border border-violet-200 dark:border-violet-500/30 text-violet-700 dark:text-violet-300 hover:bg-violet-100 dark:hover:bg-violet-500/25 rounded-lg text-xs font-semibold cursor-pointer select-none transition-all whitespace-nowrap shrink-0"
                             title="Store written draft as a sequential segment block"
                           >
                             <span>+ Store segment</span>
@@ -2159,7 +2325,7 @@ export default function FeynmanArena({
                           id="btn-trigger-clear"
                           onClick={handleClearText}
                           type="button"
-                          className="flex items-center space-x-1.5 py-1.5 px-3 rounded-lg text-xs font-medium text-slate-450 hover:text-red-400 hover:bg-red-950/10 transition-all cursor-pointer"
+                          className="flex items-center space-x-1.5 py-1.5 px-3 rounded-lg text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/20 transition-all cursor-pointer whitespace-nowrap shrink-0"
                         >
                           <Trash2 className="w-4 h-4" />
                           <span>Clear</span>
@@ -2170,11 +2336,11 @@ export default function FeynmanArena({
                           id="btn-trigger-grade"
                           onClick={handleGradeExplanation}
                           disabled={((explanationBlocks.length === 0 && !explanationText.trim()) || isGrading)}
-                          whileHover={{ scale: 1.02 }}
-                          whileTap={{ scale: 0.98 }}
-                          className="py-2.5 px-6 rounded-full bg-[#1e0e28] border border-[#d946ef]/60 disabled:border-slate-800 text-[#f3e8ff] disabled:text-slate-500 hover:text-white hover:bg-[#281136] disabled:bg-slate-950/20 transition-all text-xs font-bold flex items-center space-x-2 cursor-pointer"
+                          whileHover={{ scale: 1.01 }}
+                          whileTap={{ scale: 0.99 }}
+                          className="py-2.5 px-6 rounded-xl bg-violet-600 hover:bg-violet-700 disabled:bg-slate-200 dark:disabled:bg-white/[0.06] text-white disabled:text-slate-400 dark:disabled:text-slate-500 shadow-xs transition-all text-xs font-semibold flex items-center space-x-2 cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0"
                         >
-                          <CheckCircle2 className="w-4 h-4 text-purple-400" />
+                          <CheckCircle2 className="w-4 h-4" />
                           <span>Grade it</span>
                         </motion.button>
                       </div>
@@ -2196,21 +2362,23 @@ export default function FeynmanArena({
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -5 }}
                   transition={{ duration: 0.25 }}
-                  className="max-w-4xl mx-auto w-full flex-1 flex flex-col items-center justify-center text-center p-12 bg-[#040416]/50 border border-[#1b1b42]/60 rounded-2xl min-h-[400px]"
+                  className="max-w-4xl mx-auto w-full flex-1 flex flex-col items-center justify-center text-center p-12 bg-white dark:bg-[#0E0E1D] border border-slate-200/90 dark:border-white/[0.08] rounded-2xl min-h-[400px] shadow-xs"
                   id="empty-feedback"
                 >
-                  <Award className="w-12 h-12 text-[#d946ef] mb-4 animate-pulse" />
-                  <h3 className="text-base font-bold text-slate-200">No grading scorecard generated yet</h3>
-                  <p className="text-xs text-slate-400 max-w-sm mt-2 leading-relaxed font-semibold">
-                    You have not yet graded your explanation for <span className="text-[#d946ef] font-bold">"{selectedConcept?.title || "this concept"}"</span>. Spend some time teaching Feynman in the "Explain it" tab, and click "Grade it" to instantly generate detailed interactive scores!
+                  <div className="w-12 h-12 rounded-2xl bg-violet-50 dark:bg-violet-500/15 border border-violet-200/80 dark:border-violet-500/25 flex items-center justify-center mb-4">
+                    <Award className="w-6 h-6 text-violet-600 dark:text-violet-400" />
+                  </div>
+                  <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">No grading scorecard generated yet</h3>
+                  <p className="text-xs text-slate-600 dark:text-slate-400 max-w-sm mt-2 leading-relaxed">
+                    You have not yet graded your explanation for <span className="text-violet-600 dark:text-violet-400 font-semibold">"{selectedConcept?.title || "this concept"}"</span>. Teach Feynman in the "Explain it" tab, then click "Grade it" to view your scorecard.
                   </p>
                   <button
                     id="btn-empty-explain-redirect"
                     onClick={() => setActiveTab("explain")}
-                    className="mt-6 px-6 py-2.5 rounded-full bg-[#1e0e28] border border-[#d946ef]/65 text-purple-200 hover:text-white hover:bg-[#2c123b] transition-all text-xs font-bold flex items-center space-x-2 cursor-pointer shadow-[0_0_12px_rgba(217,70,239,0.12)]"
+                    className="mt-6 px-6 py-2.5 rounded-xl bg-violet-600 hover:bg-violet-700 text-white transition-all text-xs font-semibold flex items-center space-x-2 cursor-pointer shadow-xs"
                   >
                     <span>Start Teaching Now</span>
-                    <ArrowRight className="w-3.5 h-3.5 text-purple-400" />
+                    <ArrowRight className="w-3.5 h-3.5" />
                   </button>
                 </motion.div>
               );
@@ -2229,49 +2397,66 @@ export default function FeynmanArena({
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -5 }}
                 transition={{ duration: 0.25 }}
-                className="max-w-4xl mx-auto w-full flex-1 flex flex-col space-y-7 pb-10"
+                className="max-w-4xl mx-auto w-full flex-1 flex flex-col space-y-6 pb-10"
                 id="details-feedback-container"
               >
-                {/* Sliders Area (Matches screenshot styling exactly) */}
-                <div className="space-y-6" id="feedback-sliders-group">
+                {/* Big Grade Box Layout */}
+                <div 
+                  className="rounded-2xl border border-slate-200/90 dark:border-white/[0.08] bg-white dark:bg-[#0E0E1D] p-6 space-y-4 shadow-xs" 
+                  id="feedback-grade-card"
+                >
+                  <div className="flex justify-between items-center">
+                    <span className="text-sm font-semibold text-slate-600 dark:text-slate-300">Overall Grade · {currentConceptKey}</span>
+                    <span className="text-3xl font-bold text-slate-900 dark:text-white tabular-nums">{computedGradeAvg}%</span>
+                  </div>
+                  <div className="w-full bg-slate-100 dark:bg-white/[0.06] h-2.5 rounded-full overflow-hidden">
+                    <div 
+                      className="bg-violet-600 dark:bg-fuchsia-500 h-full rounded-full transition-all duration-500"
+                      style={{ width: `${computedGradeAvg}%` }}
+                    />
+                  </div>
+                </div>
+
+                {/* Sliders Area */}
+                <div className="rounded-2xl border border-slate-200/90 dark:border-white/[0.08] bg-white dark:bg-[#0E0E1D] p-6 space-y-5 shadow-xs" id="feedback-sliders-group">
                   
-                  {/* Simplicity Slider */}
-                  <div className="space-y-2.5" id="slider-simplicity-container">
+                  {/* Simplicity */}
+                  <div className="space-y-2" id="slider-simplicity-container">
                     <div className="flex justify-between items-center text-sm">
-                      <span className="font-semibold text-slate-350">Simplicity</span>
-                      <span className="font-bold text-slate-400">{activeScoreCard.simplicity}%</span>
+                      <span className="font-semibold text-slate-700 dark:text-slate-200">Simplicity</span>
+                      <span className="font-semibold text-slate-600 dark:text-slate-400 font-mono tabular-nums">{activeScoreCard.simplicity}%</span>
                     </div>
-                    <div className="w-full bg-[#0a0a24] h-2 rounded-full overflow-hidden">
+                    <div className="w-full bg-slate-100 dark:bg-white/[0.06] h-2 rounded-full overflow-hidden">
                       <div 
-                        className="bg-[#d946ef] h-full rounded-full transition-all duration-500"
+                        className="bg-violet-600 dark:bg-fuchsia-500 h-full rounded-full transition-all duration-500"
                         style={{ width: `${activeScoreCard.simplicity}%` }}
                       />
                     </div>
                   </div>
 
-                  {/* Completeness Slider */}
-                  <div className="space-y-2.5" id="slider-completeness-container">
+                  {/* Completeness */}
+                  <div className="space-y-2" id="slider-completeness-container">
                     <div className="flex justify-between items-center text-sm">
-                      <span className="font-semibold text-slate-350">Completeness</span>
-                      <span className="font-bold text-slate-400">{activeScoreCard.completeness}%</span>
+                      <span className="font-semibold text-slate-700 dark:text-slate-200">Completeness</span>
+                      <span className="font-semibold text-slate-600 dark:text-slate-400 font-mono tabular-nums">{activeScoreCard.completeness}%</span>
                     </div>
-                    <div className="w-full bg-[#0a0a24] h-2 rounded-full overflow-hidden">
+                    <div className="w-full bg-slate-100 dark:bg-white/[0.06] h-2 rounded-full overflow-hidden">
                       <div 
-                        className="bg-[#d946ef] h-full rounded-full transition-all duration-500"
+                        className="bg-violet-600 dark:bg-fuchsia-500 h-full rounded-full transition-all duration-500"
                         style={{ width: `${activeScoreCard.completeness}%` }}
                       />
                     </div>
                   </div>
 
-                  {/* Accuracy Slider */}
-                  <div className="space-y-2.5" id="slider-accuracy-container">
+                  {/* Accuracy */}
+                  <div className="space-y-2" id="slider-accuracy-container">
                     <div className="flex justify-between items-center text-sm">
-                      <span className="font-semibold text-slate-350">Accuracy</span>
-                      <span className="font-bold text-slate-400">{activeScoreCard.accuracy}%</span>
+                      <span className="font-semibold text-slate-700 dark:text-slate-200">Accuracy</span>
+                      <span className="font-semibold text-slate-600 dark:text-slate-400 font-mono tabular-nums">{activeScoreCard.accuracy}%</span>
                     </div>
-                    <div className="w-full bg-[#0a0a24] h-2 rounded-full overflow-hidden">
+                    <div className="w-full bg-slate-100 dark:bg-white/[0.06] h-2 rounded-full overflow-hidden">
                       <div 
-                        className="bg-[#d946ef] h-full rounded-full transition-all duration-500"
+                        className="bg-violet-600 dark:bg-fuchsia-500 h-full rounded-full transition-all duration-500"
                         style={{ width: `${activeScoreCard.accuracy}%` }}
                       />
                     </div>
@@ -2279,68 +2464,89 @@ export default function FeynmanArena({
 
                 </div>
 
-                {/* Big Grade Box Layout (Matches Screenshot Exactly) */}
-                <div 
-                  className="rounded-2xl border border-[#1b1b42]/60 bg-[#06061d]/40 p-6 space-y-4 shadow-[0_4px_24px_rgba(30,14,40,0.2)]" 
-                  id="feedback-grade-card"
-                >
-                  <div className="flex justify-between items-center">
-                    <span className="text-base md:text-lg font-bold text-slate-200">Grade</span>
-                    <span className="text-2xl md:text-3xl font-black text-white">{computedGradeAvg}%</span>
-                  </div>
-                  <div className="w-full bg-[#030310] h-3 rounded-full overflow-hidden">
-                    <div 
-                      className="bg-[#d946ef] h-full rounded-full shadow-[0_0_12px_rgba(217,70,239,0.4)] transition-all duration-500"
-                      style={{ width: `${computedGradeAvg}%` }}
-                    />
-                  </div>
-                </div>
-
-                {/* Gaps in Understanding List (Matches Screenshot Exactly) */}
-                <div className="space-y-4" id="gaps-understanding-section">
-                  <h3 className="text-base md:text-lg font-black text-slate-200 tracking-tight">
+                {/* Gaps in Understanding List */}
+                <div className="space-y-3" id="gaps-understanding-section">
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 tracking-tight">
                     Gaps in Understanding
                   </h3>
-                  <div className="space-y-3.5" id="gaps-understanding-list">
+                  <div className="space-y-2.5" id="gaps-understanding-list">
                     {activeScoreCard.gaps.map((gap, idx) => (
                       <div 
                         key={idx} 
-                        className="flex items-center space-x-3.5 bg-[#06061f]/45 border border-[#1b1b4a]/40 px-5 py-4 rounded-xl shadow-[0_2px_8px_rgba(0,0,0,0.15)]"
+                        className="flex items-start space-x-3 bg-white dark:bg-[#0E0E1D] border border-slate-200/90 dark:border-white/[0.08] px-4 py-3.5 rounded-xl shadow-xs"
                         id={`gap-item-${idx}`}
                       >
-                        <span className="text-[#d946ef] text-[10px] sm:text-xs font-semibold shrink-0">●</span>
-                        <p className="text-xs md:text-sm text-slate-300 font-medium leading-relaxed">{gap}</p>
+                        <span className="w-1.5 h-1.5 rounded-full bg-violet-600 dark:bg-fuchsia-400 mt-2 shrink-0" />
+                        <p className="text-xs md:text-sm text-slate-700 dark:text-slate-300 leading-relaxed">{gap}</p>
                       </div>
                     ))}
                   </div>
                 </div>
 
                 {/* Curious Student Follow-up Question Card */}
-                <div className="rounded-2xl border border-dashed border-[#d946ef]/20 bg-[#160a24]/30 p-5 mt-2" id="feynman-followup-card">
-                  <div className="flex items-center space-x-2.5 mb-3">
-                    <BrainCircuit className="w-4.5 h-4.5 text-[#d946ef] animate-pulse" />
-                    <span className="text-xs font-bold uppercase tracking-widest text-[#d946ef]">Feynman's Follow-up Question</span>
+                <div className="rounded-2xl border border-violet-200/80 dark:border-violet-500/25 bg-violet-50/60 dark:bg-violet-950/20 p-5" id="feynman-followup-card">
+                  <div className="flex items-center space-x-2 mb-2.5">
+                    <BrainCircuit className="w-4 h-4 text-violet-600 dark:text-violet-400" />
+                    <span className="text-xs font-semibold uppercase tracking-wider text-violet-700 dark:text-violet-300">Feynman's Follow-up Question</span>
                   </div>
-                  <p className="text-xs md:text-sm text-slate-200 font-medium leading-relaxed italic bg-[#030310]/50 border border-[#1d1d42]/40 p-4 rounded-xl">
+                  <p className="text-xs md:text-sm text-slate-800 dark:text-slate-200 font-medium leading-relaxed italic">
                     "{activeScoreCard.feedbackText}"
                   </p>
                 </div>
 
+                {/* Grounded Source Passages (from Vector Retrieval) */}
+                {activeScoreCard.citations && activeScoreCard.citations.length > 0 && (
+                  <div className="space-y-3" id="feedback-citations-section">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 tracking-tight">
+                        Referenced Study Material Passages
+                      </h3>
+                      {activeScoreCard.retrievalLatencyMs !== undefined && (
+                        <span className="text-[11px] font-mono text-slate-400 dark:text-slate-500 tabular-nums">
+                          Retrieved in {activeScoreCard.retrievalLatencyMs}ms
+                        </span>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                      {activeScoreCard.citations.map((cit, idx) => (
+                        <div
+                          key={`${cit.chunkId}-${idx}`}
+                          className="rounded-xl border border-slate-200/90 dark:border-white/[0.08] bg-white dark:bg-[#0E0E1D] p-3.5 space-y-1.5 shadow-xs"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-semibold text-violet-700 dark:text-violet-300 truncate">
+                              {cit.sectionTitle || "Study Passage"}
+                            </span>
+                            <span className="text-[10px] font-mono font-semibold text-slate-500 dark:text-slate-400 bg-slate-100 dark:bg-white/[0.06] px-2 py-0.5 rounded shrink-0 tabular-nums">
+                              {cit.pageNumber === cit.pageEnd
+                                ? `Page ${cit.pageNumber}`
+                                : `Pages ${cit.pageNumber}–${cit.pageEnd}`}
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed line-clamp-3">
+                            {cit.excerpt}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 {/* Bottom Action Footer Row */}
-                <div className="flex items-center justify-between pt-6 border-t border-[#12122b]/60" id="feedback-actions-row">
+                <div className="flex items-center justify-between pt-5 border-t border-slate-200/80 dark:border-white/[0.07]" id="feedback-actions-row">
                   
                   {/* Bottom Left: Mark Revised button */}
                   <button
                     id="btn-mark-revised"
                     onClick={handleMarkRevised}
-                    className={`flex items-center space-x-2 px-5 py-2.5 rounded-full border transition-all text-xs font-bold cursor-pointer ${
+                    className={`flex items-center space-x-2 px-5 py-2.5 rounded-xl border transition-all text-xs font-semibold cursor-pointer ${
                       revisedConcepts.includes(currentConceptKey)
-                        ? "bg-emerald-950/45 border-emerald-500/80 text-emerald-300"
-                        : "bg-[#06061f]/20 border-slate-800 text-slate-450 hover:text-white hover:bg-slate-900"
+                        ? "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-500/40 text-emerald-700 dark:text-emerald-300"
+                        : "bg-white dark:bg-white/[0.04] border-slate-200 dark:border-white/10 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-white/[0.08]"
                     }`}
                   >
-                    <CheckCircle className="w-4 h-4 text-emerald-400" />
-                    <span>{revisedConcepts.includes(currentConceptKey) ? "Revised ✓" : "Mark revised"}</span>
+                    <CheckCircle className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                    <span>{revisedConcepts.includes(currentConceptKey) ? "Revised" : "Mark revised"}</span>
                   </button>
 
                   {/* Bottom Right: Try Again Button */}
@@ -2349,9 +2555,9 @@ export default function FeynmanArena({
                     onClick={() => {
                       setActiveTab("explain");
                     }}
-                    className="flex items-center space-x-2 px-6 py-2.5 rounded-full bg-[#1e0e28] border border-[#d946ef]/65 text-purple-200 hover:text-white hover:bg-[#281136] transition-all text-xs font-bold cursor-pointer shadow-[0_0_12px_rgba(217,70,239,0.1)]"
+                    className="flex items-center space-x-2 px-5 py-2.5 rounded-xl bg-violet-600 hover:bg-violet-700 text-white transition-all text-xs font-semibold cursor-pointer shadow-xs"
                   >
-                    <RotateCcw className="w-4 h-4 text-purple-400" />
+                    <RotateCcw className="w-4 h-4" />
                     <span>Try again</span>
                   </button>
 
@@ -2364,11 +2570,11 @@ export default function FeynmanArena({
                       initial={{ opacity: 0, y: 15 }}
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0, y: 15 }}
-                      className="fixed bottom-6 left-6 bg-[#041c0e] border border-emerald-500/40 px-5 py-3 rounded-xl shadow-lg flex items-center space-x-3.5 z-55"
+                      className="fixed bottom-6 left-6 bg-white dark:bg-[#0a1f14] border border-emerald-200 dark:border-emerald-500/40 px-4 py-3 rounded-xl shadow-lg flex items-center space-x-3 z-50"
                       id="revised-concept-toast"
                     >
-                      <CheckCircle className="w-4.5 h-4.5 text-emerald-400" />
-                      <span className="text-xs font-semibold text-emerald-200">Concept marked as revised successfully!</span>
+                      <CheckCircle className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                      <span className="text-xs font-semibold text-emerald-800 dark:text-emerald-200">Concept marked as revised successfully!</span>
                     </motion.div>
                   )}
                 </AnimatePresence>
@@ -2421,17 +2627,17 @@ export default function FeynmanArena({
             const overallMastery = gradedCount === 0 ? 0 : Math.round(totalScoreSum / gradedCount);
 
             // Center Big Circle colors based on mastery level
-            let mainBgColor = "fill-[#1d0e26]";
-            let mainStrokeColor = "stroke-purple-500/80";
-            let mainGlowColor = "rgba(217, 70, 239, 0.3)";
+            let mainBgColor = "fill-violet-50 dark:fill-[#1b102d]";
+            let mainStrokeColor = "stroke-violet-500/80 dark:stroke-purple-500/80";
+            let mainGlowColor = theme === "dark" ? "rgba(217, 70, 239, 0.25)" : "rgba(124, 58, 237, 0.14)";
             if (overallMastery >= 85) {
-              mainBgColor = "fill-[#051c0e]";
+              mainBgColor = "fill-emerald-50 dark:fill-[#072114]";
               mainStrokeColor = "stroke-emerald-500/80";
-              mainGlowColor = "rgba(16, 185, 129, 0.4)";
+              mainGlowColor = theme === "dark" ? "rgba(16, 185, 129, 0.3)" : "rgba(16, 185, 129, 0.16)";
             } else if (overallMastery >= 60) {
-              mainBgColor = "fill-[#1c1205]";
+              mainBgColor = "fill-amber-50 dark:fill-[#221707]";
               mainStrokeColor = "stroke-amber-500/80";
-              mainGlowColor = "rgba(245, 158, 11, 0.35)";
+              mainGlowColor = theme === "dark" ? "rgba(245, 158, 11, 0.28)" : "rgba(245, 158, 11, 0.16)";
             }
 
             // Map subtopics to orbit coordinates and style attributes
@@ -2454,28 +2660,28 @@ export default function FeynmanArena({
 
               // Mastery status color coding
               const sc = scoreCards[concept.title];
-              let nodeColor = "#d946ef"; // pink for not graded
-              let nodeBgClass = "fill-purple-950/30";
-              let nodeStrokeClass = "stroke-purple-500/50 hover:stroke-[#d946ef]";
+              let nodeColor = "#8b5cf6";
+              let nodeBgClass = "fill-violet-50 dark:fill-[#17112b]";
+              let nodeStrokeClass = "stroke-violet-400/80 dark:stroke-purple-500/60 hover:stroke-violet-600 dark:hover:stroke-[#d946ef]";
               let nodeTitle = "Study Needed";
 
               if (sc) {
                 const avg = Math.round((Number(sc.simplicity || 0) + Number(sc.completeness || 0) + Number(sc.accuracy || 0)) / 3);
                 if (avg >= 85) {
-                  nodeColor = "#10b981"; // emerald for mastered
-                  nodeBgClass = "fill-emerald-950/45";
-                  nodeStrokeClass = "stroke-emerald-500/60 hover:stroke-emerald-450";
+                  nodeColor = "#10b981";
+                  nodeBgClass = "fill-emerald-50 dark:fill-emerald-950/60";
+                  nodeStrokeClass = "stroke-emerald-500/75 hover:stroke-emerald-600 dark:hover:stroke-emerald-400";
                   nodeTitle = `Mastered (${avg}%)`;
                 } else if (avg >= 60) {
-                  nodeColor = "#f59e0b"; // amber for partial
-                  nodeBgClass = "fill-amber-955/30";
-                  nodeStrokeClass = "stroke-amber-500/60 hover:stroke-amber-450";
+                  nodeColor = "#f59e0b";
+                  nodeBgClass = "fill-amber-50 dark:fill-amber-950/50";
+                  nodeStrokeClass = "stroke-amber-500/75 hover:stroke-amber-600 dark:hover:stroke-amber-400";
                   nodeTitle = `Developing (${avg}%)`;
                 } else {
-                  nodeColor = "#ef4444"; // red for needs work
-                  nodeBgClass = "fill-rose-955/25";
-                  nodeStrokeClass = "stroke-rose-500/60 hover:stroke-rose-450";
-                  nodeTitle = `Substandard (${avg}%)`;
+                  nodeColor = "#ef4444";
+                  nodeBgClass = "fill-rose-50 dark:fill-rose-950/50";
+                  nodeStrokeClass = "stroke-rose-500/75 hover:stroke-rose-600 dark:hover:stroke-rose-400";
+                  nodeTitle = `Needs Work (${avg}%)`;
                 }
               }
 
@@ -2504,32 +2710,32 @@ export default function FeynmanArena({
                 id="details-map-container"
               >
                 {/* Sub-navigation Switcher Bar */}
-                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-[#05051b]/60 border border-[#1b1b42]/70 rounded-xl p-3" id="map-subnav-bar">
-                  <div className="flex items-center space-x-2">
+                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-white dark:bg-[#0E0E1D] border border-slate-200/90 dark:border-white/[0.08] rounded-xl p-2.5 shadow-xs" id="map-subnav-bar">
+                  <div className="flex items-center p-0.5 rounded-lg bg-slate-100 dark:bg-white/[0.04] border border-slate-200/80 dark:border-white/[0.06] gap-1">
                     <button
                       onClick={() => setMapSubView("orbit")}
-                      className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-all flex items-center space-x-2 cursor-pointer ${
+                      className={`px-3.5 py-1.5 rounded-md text-xs font-semibold transition-all flex items-center space-x-2 cursor-pointer whitespace-nowrap shrink-0 ${
                         mapSubView === "orbit"
-                          ? "bg-[#1e0e28] border border-[#d946ef]/60 text-white shadow-[0_0_12px_rgba(217,70,239,0.18)]"
-                          : "bg-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/40"
+                          ? "bg-white dark:bg-[#19192e] text-slate-900 dark:text-white shadow-xs"
+                          : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
                       }`}
                     >
-                      <Sliders className="w-4 h-4 text-purple-400" />
+                      <Sliders className="w-3.5 h-3.5 text-violet-600 dark:text-violet-400" />
                       <span>Interactive Orbit Map</span>
                     </button>
 
                     <button
                       onClick={() => setMapSubView("quiz")}
-                      className={`px-3.5 py-2 rounded-lg text-xs font-bold transition-all flex items-center space-x-2 cursor-pointer ${
+                      className={`px-3.5 py-1.5 rounded-md text-xs font-semibold transition-all flex items-center space-x-2 cursor-pointer whitespace-nowrap shrink-0 ${
                         mapSubView === "quiz"
-                          ? "bg-[#1e0e28] border border-[#d946ef]/60 text-white shadow-[0_0_12px_rgba(217,70,239,0.18)]"
-                          : "bg-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/40"
+                          ? "bg-white dark:bg-[#19192e] text-slate-900 dark:text-white shadow-xs"
+                          : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
                       }`}
                     >
-                      <Layers className="w-4 h-4 text-purple-400" />
+                      <Layers className="w-3.5 h-3.5 text-violet-600 dark:text-violet-400" />
                       <span>Flashcard Quiz Deck</span>
                       {flashcards.length > 0 && (
-                        <span className="bg-purple-900/60 text-purple-200 text-[10px] px-2 py-0.5 rounded-full font-mono font-bold">
+                        <span className="bg-violet-100 dark:bg-violet-500/20 text-violet-700 dark:text-violet-300 text-[10px] px-2 py-0.5 rounded-full font-mono font-semibold tabular-nums">
                           {flashcards.length}
                         </span>
                       )}
@@ -2541,9 +2747,9 @@ export default function FeynmanArena({
                       <button
                         onClick={handleGenerateAiFlashcards}
                         disabled={loadingFlashcards}
-                        className="px-3.5 py-1.5 rounded-lg bg-purple-950/50 border border-purple-500/40 text-purple-200 hover:text-white hover:bg-purple-900/60 text-xs font-bold flex items-center space-x-1.5 transition-all cursor-pointer disabled:opacity-50"
+                        className="px-3.5 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold flex items-center space-x-1.5 transition-all cursor-pointer disabled:opacity-50 whitespace-nowrap shrink-0 shadow-xs"
                       >
-                        <Sparkles className={`w-3.5 h-3.5 ${loadingFlashcards ? "animate-spin text-purple-400" : "text-purple-300"}`} />
+                        <Sparkles className={`w-3.5 h-3.5 ${loadingFlashcards ? "animate-spin" : ""}`} />
                         <span>{loadingFlashcards ? "Generating Deck..." : "AI Generate Cards"}</span>
                       </button>
                     )}
@@ -2552,40 +2758,46 @@ export default function FeynmanArena({
 
                 {/* MODE 1: INTERACTIVE CONSTELLATION MAP */}
                 {mapSubView === "orbit" && (
-                  <div className="flex flex-col lg:flex-row gap-6 flex-1 items-stretch" id="knowledge-map-root-layout">
+                  <div className="flex flex-col lg:flex-row gap-5 flex-1 items-stretch" id="knowledge-map-root-layout">
                     
                     {/* Left Column: Interactive Constellation Graph */}
-                    <div className="flex-1 bg-[#05051b]/45 border border-[#1b1b42]/70 rounded-xl p-6 flex flex-col justify-between relative overflow-hidden" id="knowledge-map-workspace">
+                    <div className="flex-1 bg-white dark:bg-[#0E0E1D] border border-slate-200/90 dark:border-white/[0.08] rounded-2xl p-6 flex flex-col justify-between relative overflow-hidden shadow-xs" id="knowledge-map-workspace">
                       <div id="knowledge-map-meta" className="relative z-20">
-                        <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center space-x-2">
-                          <Sliders className="w-4 h-4 text-purple-400" />
+                        <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 tracking-tight flex items-center space-x-2">
+                          <Sliders className="w-4 h-4 text-violet-600 dark:text-violet-400" />
                           <span>Interactive Concept Map</span>
                         </h3>
-                        <p className="text-xs text-slate-500 mt-1">
-                          A visual orbit constellation showing fundamental subtopics. Click nodes to inspect. Bubble size represents topic importance weight.
+                        <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                          {file.documentOverview || "Click any subtopic node to inspect its summary, or double-click to start explaining."}
                         </p>
                       </div>
 
                       {/* SVG Constellation Stage */}
-                      <div className="flex-1 min-h-[380px] border border-dashed border-[#14143a]/70 rounded-xl my-5 bg-[#02020a]/80 flex items-center justify-center relative overflow-hidden" id="canvas-map-deck">
-                        {/* Grid overlay */}
-                        <div className="absolute inset-0 bg-[linear-gradient(to_right,#12122b_1px,transparent_1px),linear-gradient(to_bottom,#12122b_1px,transparent_1px)] bg-[size:24px_24px] opacity-15" />
+                      <div className="flex-1 min-h-[380px] border border-slate-200/80 dark:border-white/[0.06] rounded-xl my-5 bg-slate-50/70 dark:bg-[#080814] flex items-center justify-center relative overflow-hidden" id="canvas-map-deck">
+                        {/* Architectural Grid overlay */}
+                        <div
+                          className="absolute inset-0 opacity-60 dark:opacity-20 pointer-events-none"
+                          style={{
+                            backgroundImage: `linear-gradient(to right, ${theme === "dark" ? "#1e1e3f" : "#e2e8f0"} 1px, transparent 1px), linear-gradient(to bottom, ${theme === "dark" ? "#1e1e3f" : "#e2e8f0"} 1px, transparent 1px)`,
+                            backgroundSize: "24px 24px"
+                          }}
+                        />
                         
                         {concepts.length === 0 ? (
                           <div className="text-center relative z-10" id="empty-map-fallback">
-                            <div className="w-6 h-6 border-2 border-purple-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
-                            <span className="text-xs text-slate-550">Mapping constellation...</span>
+                            <div className="w-6 h-6 border-2 border-violet-600 dark:border-violet-400 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+                            <span className="text-xs text-slate-500 dark:text-slate-400">Mapping constellation...</span>
                           </div>
                         ) : (
                           <svg className="w-full h-full min-h-[375px] relative z-20" viewBox="0 0 660 420" id="concept-map-canvas">
                             <defs>
                               <radialGradient id="centerGlow" cx="50%" cy="50%" r="50%">
-                                <stop offset="0%" stopColor="#1e0e2a" stopOpacity="0.8"/>
-                                <stop offset="100%" stopColor="#030312" stopOpacity="0"/>
+                                <stop offset="0%" stopColor={theme === "dark" ? "#2e1065" : "#ddd6fe"} stopOpacity="0.65"/>
+                                <stop offset="100%" stopColor={theme === "dark" ? "#080814" : "#f8fafc"} stopOpacity="0"/>
                               </radialGradient>
                             </defs>
 
-                            {/* 1. DRAW LINKS FIRST (so they overlay behind nodes) */}
+                            {/* 1. DRAW LINKS FIRST */}
                             {nodes.map((node, i) => {
                               const isSelected = selectedConcept?.id === node.concept.id;
                               return (
@@ -2597,8 +2809,8 @@ export default function FeynmanArena({
                                     y2={node.y}
                                     className={`transition-all duration-300 ${
                                       isSelected 
-                                        ? "stroke-[#d946ef] stroke-[2]" 
-                                        : "stroke-slate-550/25 stroke-[1.25]"
+                                        ? "stroke-violet-600 dark:stroke-fuchsia-400 stroke-[2]" 
+                                        : "stroke-slate-300 dark:stroke-slate-700 stroke-[1.25]"
                                     }`}
                                     strokeDasharray={isSelected ? "none" : "4 4"}
                                   />
@@ -2610,7 +2822,7 @@ export default function FeynmanArena({
                                       y2={node.y}
                                       stroke={node.nodeColor}
                                       strokeWidth="3.5"
-                                      className="opacity-15 animate-pulse"
+                                      className="opacity-20"
                                     />
                                   )}
                                 </g>
@@ -2619,7 +2831,6 @@ export default function FeynmanArena({
 
                             {/* 2. DRAW CENTER BIG CIRCLE (Main Topic) */}
                             <g className="cursor-default select-none" id="main-topic-center-node">
-                              {/* Outer orbital rings */}
                               <circle
                                 cx={centerX}
                                 cy={centerY}
@@ -2627,7 +2838,7 @@ export default function FeynmanArena({
                                 fill="url(#centerGlow)"
                                 stroke={overallMastery > 0 ? (overallMastery >= 85 ? "#10b981" : "#f59e0b") : "#8b5cf6"}
                                 strokeWidth="1"
-                                className="opacity-15 stroke-dasharray-[4_3] animate-[spin_40s_linear_infinite]"
+                                className="opacity-25 stroke-dasharray-[4_3] animate-[spin_40s_linear_infinite]"
                               />
                               <circle
                                 cx={centerX}
@@ -2637,7 +2848,6 @@ export default function FeynmanArena({
                                 strokeWidth="2.5"
                                 style={{ filter: `drop-shadow(0px 0px 12px ${mainGlowColor})` }}
                               />
-                              {/* Text labels inside center node */}
                               {(() => {
                                 const lines = fitTopicText(mainTopicName);
                                 if (lines.length === 2) {
@@ -2648,7 +2858,7 @@ export default function FeynmanArena({
                                         y={centerY - 8}
                                         textAnchor="middle"
                                         dominantBaseline="central"
-                                        className="fill-white text-[9px] sm:text-[9.5px] font-black select-none tracking-wider uppercase"
+                                        className="fill-slate-900 dark:fill-white text-[9px] sm:text-[9.5px] font-bold select-none tracking-wider uppercase"
                                       >
                                         {lines[0]}
                                       </text>
@@ -2657,7 +2867,7 @@ export default function FeynmanArena({
                                         y={centerY + 3}
                                         textAnchor="middle"
                                         dominantBaseline="central"
-                                        className="fill-white text-[9px] sm:text-[9.5px] font-black select-none tracking-wider uppercase"
+                                        className="fill-slate-900 dark:fill-white text-[9px] sm:text-[9.5px] font-bold select-none tracking-wider uppercase"
                                       >
                                         {lines[1]}
                                       </text>
@@ -2666,7 +2876,7 @@ export default function FeynmanArena({
                                         y={centerY + 16}
                                         textAnchor="middle"
                                         dominantBaseline="central"
-                                        className="fill-slate-400 text-[8px] font-extrabold select-none tracking-wider font-mono opacity-80"
+                                        className="fill-slate-500 dark:fill-slate-400 text-[8px] font-semibold select-none tracking-wider font-mono"
                                       >
                                         {overallMastery > 0 ? `${overallMastery}% Mastery` : "Click Nodes"}
                                       </text>
@@ -2680,7 +2890,7 @@ export default function FeynmanArena({
                                       y={centerY - 2}
                                       textAnchor="middle"
                                       dominantBaseline="central"
-                                      className="fill-white text-[10px] sm:text-[11px] font-black select-none tracking-wider uppercase"
+                                      className="fill-slate-900 dark:fill-white text-[10px] sm:text-[11px] font-bold select-none tracking-wider uppercase"
                                     >
                                       {lines[0]}
                                     </text>
@@ -2689,7 +2899,7 @@ export default function FeynmanArena({
                                       y={centerY + 12}
                                       textAnchor="middle"
                                       dominantBaseline="central"
-                                      className="fill-slate-400 text-[8px] font-extrabold select-none tracking-wider font-mono opacity-80"
+                                      className="fill-slate-500 dark:fill-slate-400 text-[8px] font-semibold select-none tracking-wider font-mono"
                                     >
                                       {overallMastery > 0 ? `${overallMastery}% Mastery` : "Click Nodes"}
                                     </text>
@@ -2708,15 +2918,15 @@ export default function FeynmanArena({
                                   onClick={() => setSelectedConcept(node.concept)}
                                   onDoubleClick={() => handleSelectConcept(node.concept)}
                                 >
-                                  {/* Glowing outer wrapper if selected */}
+                                  {/* Outer ring highlight */}
                                   <circle
                                     cx={node.x}
                                     cy={node.y}
                                     r={node.radius + 6}
                                     className={`fill-transparent stroke-transparent transition-all duration-300 ${
                                       isSelected 
-                                        ? "stroke-[#d946ef]/50 fill-[#d946ef]/5" 
-                                        : "group-hover:stroke-slate-800"
+                                        ? "stroke-violet-500/60 dark:stroke-fuchsia-400/60 fill-violet-500/5" 
+                                        : "group-hover:stroke-slate-300 dark:group-hover:stroke-slate-700"
                                     }`}
                                     strokeWidth="1"
                                     strokeDasharray={isSelected ? "none" : "2 2"}
@@ -2727,33 +2937,33 @@ export default function FeynmanArena({
                                     cx={node.x}
                                     cy={node.y}
                                     r={node.radius}
-                                    className={`${node.nodeBgClass} ${node.nodeStrokeClass} transition-all duration-350`}
-                                    strokeWidth={isSelected ? "2" : "1"}
+                                    className={`${node.nodeBgClass} ${node.nodeStrokeClass} transition-all duration-300`}
+                                    strokeWidth={isSelected ? "2" : "1.5"}
                                     style={{
-                                      filter: isSelected ? `drop-shadow(0px 0px 8px ${node.nodeColor}60)` : "none"
+                                      filter: isSelected ? `drop-shadow(0px 0px 8px ${node.nodeColor}45)` : "none"
                                     }}
                                   />
 
-                                  {/* Subtopic index index tag */}
+                                  {/* Subtopic index tag */}
                                   <text
                                     x={node.x}
                                     y={node.y}
                                     textAnchor="middle"
                                     dominantBaseline="central"
-                                    className="fill-white text-[10px] font-black tracking-tight select-none font-mono"
+                                    className="fill-slate-900 dark:fill-white text-[10px] font-bold tracking-tight select-none font-mono"
                                   >
                                     {i + 1}
                                   </text>
 
-                                  {/* Hover tooltip or text tag label above circle */}
+                                  {/* Label above circle */}
                                   <text
                                     x={node.x}
                                     y={node.y - (node.radius + 10)}
                                     textAnchor="middle"
-                                    className={`text-[9px] font-extrabold select-none transition-colors ${
+                                    className={`text-[9.5px] font-semibold select-none transition-colors ${
                                       isSelected 
-                                        ? "fill-purple-300"
-                                        : "fill-slate-450 group-hover:fill-slate-205"
+                                        ? "fill-violet-700 dark:fill-violet-300" 
+                                        : "fill-slate-600 dark:fill-slate-400 group-hover:fill-slate-900 dark:group-hover:fill-slate-200"
                                     }`}
                                   >
                                     {node.concept.title.length > 15 
@@ -2768,29 +2978,29 @@ export default function FeynmanArena({
                       </div>
 
                       {/* Footer instructions & legend keys inside constellation panel */}
-                      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5 text-[10px] text-slate-550 px-1 relative z-20" id="canvas-map-key">
+                      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5 text-[11px] text-slate-500 dark:text-slate-400 px-1 relative z-20" id="canvas-map-key">
                         <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
                           <div className="flex items-center space-x-1.5">
-                            <span className="w-2 h-2 rounded-full bg-emerald-500/25 border border-emerald-500/80" />
+                            <span className="w-2.5 h-2.5 rounded-full bg-emerald-100 dark:bg-emerald-500/25 border border-emerald-500" />
                             <span>Mastered (85%+)</span>
                           </div>
                           <div className="flex items-center space-x-1.5">
-                            <span className="w-2 h-2 rounded-full bg-amber-500/25 border border-amber-500/80" />
+                            <span className="w-2.5 h-2.5 rounded-full bg-amber-100 dark:bg-amber-500/25 border border-amber-500" />
                             <span>Developing (60%+)</span>
                           </div>
                           <div className="flex items-center space-x-1.5">
-                            <span className="w-2 h-2 rounded-full bg-purple-500/25 border border-[#d946ef]/70" />
+                            <span className="w-2.5 h-2.5 rounded-full bg-violet-100 dark:bg-violet-500/25 border border-violet-500" />
                             <span>Study needed</span>
                           </div>
                         </div>
-                        <span className="font-medium text-slate-500 font-mono">Total Subtopics: {concepts.length}</span>
+                        <span className="font-medium text-slate-500 dark:text-slate-400 font-mono tabular-nums">Total Subtopics: {concepts.length}</span>
                       </div>
 
                     </div>
 
                     {/* Right Column: Node details & telemetry actions drawer card */}
                     <div 
-                      className="w-full lg:w-80 bg-[#06061f]/40 border border-[#1b1b42]/70 rounded-xl p-5 flex flex-col justify-between"
+                      className="w-full lg:w-80 bg-white dark:bg-[#0E0E1D] border border-slate-200/90 dark:border-white/[0.08] rounded-2xl p-5 flex flex-col justify-between shadow-xs"
                       id="inspect-details-panel"
                     >
                       {selectedConcept ? (() => {
@@ -2804,51 +3014,53 @@ export default function FeynmanArena({
                             <div className="space-y-4">
                               
                               {/* Header details block */}
-                              <div className="border-b border-[#18183c] pb-3" id="inspection-header">
-                                <span className="text-[9px] font-mono font-black uppercase tracking-wider text-[#d946ef]">Selected Concept</span>
-                                <h4 className="text-sm font-bold text-white mt-1 leading-snug">{selectedConcept.title}</h4>
+                              <div className="border-b border-slate-200/80 dark:border-white/[0.07] pb-3.5" id="inspection-header">
+                                <span className="text-[10px] font-mono font-semibold uppercase tracking-wider text-violet-600 dark:text-violet-400">Selected Concept</span>
+                                <h4 className="text-sm font-bold text-slate-900 dark:text-white mt-1 leading-snug">{selectedConcept.title}</h4>
                                 
-                                <div className="flex items-center space-x-2.5 mt-2.5" id="inspect-badges-row">
-                                  <span className={`text-[9px] font-mono px-2 py-0.5 rounded uppercase font-bold border ${
+                                <div className="flex items-center gap-2 mt-2 text-[11px] font-medium text-slate-500 dark:text-slate-400" id="inspect-badges-row">
+                                  <span className={`font-semibold ${
                                     selectedConcept.difficulty === "Hard"
-                                      ? "bg-rose-955/25 border-rose-800/30 text-rose-300"
+                                      ? "text-rose-600 dark:text-rose-400"
                                       : selectedConcept.difficulty === "Medium"
-                                      ? "bg-amber-955/25 border-amber-800/30 text-amber-300"
-                                      : "bg-emerald-955/25 border-emerald-800/30 text-emerald-300"
+                                      ? "text-amber-600 dark:text-amber-400"
+                                      : "text-emerald-600 dark:text-emerald-400"
                                   }`}>
-                                    {selectedConcept.difficulty}
+                                    {selectedConcept.difficulty} difficulty
+                                  </span>
+                                  <span>·</span>
+                                  <span className={isCompleted ? "text-emerald-600 dark:text-emerald-400" : "text-violet-600 dark:text-violet-400"}>
+                                    {nodeTitleStatus}
                                   </span>
                                 </div>
                               </div>
 
-                              {/* Info segment summary & score */}
+                              {/* Info segment summary */}
                               <div className="space-y-3" id="inspection-metrics">
-                                <div className="p-3.5 bg-[#030310]/60 border border-[#121235]/65 rounded-xl" id="inspect-summary-box">
-                                  <h5 className="text-[9px] uppercase font-bold tracking-widest text-slate-500 mb-1.5">Concept Summary</h5>
-                                  <p className="text-[11px] text-slate-350 leading-relaxed font-semibold">{selectedConcept.summary}</p>
-                                </div>
-
-                                <div className="p-3.5 bg-[#030310]/60 border border-[#121235]/65 rounded-xl" id="inspect-mastery-box">
-                                  <h5 className="text-[9px] uppercase font-bold tracking-widest text-slate-500 mb-2">Mastery Check</h5>
-                                  <div className="flex justify-between items-center text-xs">
-                                    <span className="text-slate-400 font-medium font-mono">Status:</span>
-                                    <span 
-                                      className={`font-semibold text-[11px] px-2 py-0.5 rounded-full ${
-                                        isCompleted 
-                                          ? "bg-emerald-950/20 text-emerald-400 border border-emerald-900/40" 
-                                          : "bg-purple-950/20 text-[#d946ef] border border-purple-900/40"
-                                      }`}
-                                    >
-                                      {nodeTitleStatus}
-                                    </span>
+                                <div className="p-3.5 bg-slate-50/80 dark:bg-white/[0.03] border border-slate-200/80 dark:border-white/[0.06] rounded-xl space-y-2" id="inspect-summary-box">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <h5 className="text-[10px] uppercase font-semibold tracking-wider text-slate-500 dark:text-slate-400">Concept Summary</h5>
+                                    {selectedConcept.pageStart && (
+                                      <span className="text-[10px] font-mono font-semibold text-violet-600 dark:text-violet-300 tabular-nums">
+                                        {selectedConcept.pageEnd && selectedConcept.pageEnd !== selectedConcept.pageStart
+                                          ? `pp. ${selectedConcept.pageStart}–${selectedConcept.pageEnd}`
+                                          : `p. ${selectedConcept.pageStart}`}
+                                      </span>
+                                    )}
                                   </div>
+                                  <p className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed">{selectedConcept.summary}</p>
+                                  {selectedConcept.sectionTitle && (
+                                    <p className="text-[11px] text-slate-500 dark:text-slate-400 pt-1 border-t border-slate-200/60 dark:border-white/[0.05]">
+                                      Section: {selectedConcept.sectionTitle}
+                                    </p>
+                                  )}
                                 </div>
                               </div>
 
                             </div>
 
                             {/* Trigger Call To Action */}
-                            <div className="pt-4 border-t border-[#18183c]/50 space-y-2" id="inspection-footer-actions">
+                            <div className="pt-4 border-t border-slate-200/80 dark:border-white/[0.07] space-y-2" id="inspection-footer-actions">
                               <button
                                 id="btn-inspect-quiz"
                                 onClick={() => {
@@ -2859,9 +3071,9 @@ export default function FeynmanArena({
                                   setSelectedOption(null);
                                   setQuizCompleted(false);
                                 }}
-                                className="w-full flex items-center justify-center space-x-2 py-2.5 px-4 rounded-xl bg-purple-950/30 border border-purple-500/40 text-xs font-bold text-purple-200 hover:bg-purple-900/40 hover:text-white transition-all cursor-pointer"
+                                className="w-full flex items-center justify-center space-x-2 py-2.5 px-4 rounded-xl bg-white dark:bg-white/[0.04] border border-slate-200 dark:border-white/10 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-white/[0.08] transition-all cursor-pointer"
                               >
-                                <Layers className="w-4 h-4 text-purple-300" />
+                                <Layers className="w-4 h-4 text-violet-600 dark:text-violet-400" />
                                 <span>Practice Concept Flashcards</span>
                               </button>
 
@@ -2870,13 +3082,13 @@ export default function FeynmanArena({
                                 onClick={() => {
                                   handleSelectConcept(selectedConcept);
                                 }}
-                                className="w-full flex items-center justify-center space-x-2 py-2.5 px-4 rounded-xl bg-[#1e0e28] border border-[#d946ef]/60 text-xs font-bold text-white hover:bg-[#2c123b] transition-all cursor-pointer shadow-[0_4px_12px_rgba(217,70,239,0.06)]"
+                                className="w-full flex items-center justify-center space-x-2 py-2.5 px-4 rounded-xl bg-violet-600 hover:bg-violet-700 text-xs font-semibold text-white transition-all cursor-pointer shadow-xs"
                               >
-                                <BrainCircuit className="w-4 h-4 text-purple-300 animate-pulse" />
+                                <BrainCircuit className="w-4 h-4" />
                                 <span>Teach Feynman This Concept</span>
                               </button>
-                              <p className="text-[9px] text-slate-550 text-center select-none font-medium leading-normal">
-                                Double click subtopics to launch explanation arena directly!
+                              <p className="text-[11px] text-slate-500 dark:text-slate-400 text-center select-none leading-normal pt-0.5">
+                                Double click subtopics to launch explanation arena directly.
                               </p>
                             </div>
 
@@ -2884,10 +3096,10 @@ export default function FeynmanArena({
                         );
                       })() : (
                         <div className="flex-1 flex flex-col items-center justify-center text-center p-6 space-y-3" id="inspect-empty">
-                          <BookOpen className="w-8 h-8 text-slate-700" />
-                          <span className="text-xs text-slate-450 font-bold uppercase tracking-wider">Inspect Concept Node</span>
-                          <p className="text-[11px] text-slate-550 leading-relaxed max-w-[190px] font-medium">
-                            Select any surrounding subtopic circle to display full telemetry metrics, content summaries, or launch lessons.
+                          <BookOpen className="w-8 h-8 text-slate-300 dark:text-slate-600" />
+                          <span className="text-xs text-slate-700 dark:text-slate-300 font-semibold">Inspect Concept Node</span>
+                          <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed max-w-[210px]">
+                            Select any surrounding subtopic circle to view its summary or launch a practice session.
                           </p>
                         </div>
                       )}
@@ -2968,12 +3180,12 @@ export default function FeynmanArena({
                     <div className="flex-1 flex flex-col space-y-6" id="flashcard-quiz-container">
                       
                       {/* Top Filter & Score Dashboard Bar */}
-                      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 bg-[#05051b]/45 border border-[#1b1b42]/70 rounded-xl p-4">
+                      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 bg-white dark:bg-[#0E0E1D] border border-slate-200/90 dark:border-white/[0.08] rounded-xl p-4 shadow-xs">
                         
                         {/* Concept Filter Dropdown */}
                         <div className="flex items-center space-x-2.5">
-                          <Filter className="w-4 h-4 text-purple-400" />
-                          <span className="text-xs font-semibold text-slate-400">Filter Topic:</span>
+                          <Filter className="w-4 h-4 text-violet-600 dark:text-violet-400" />
+                          <span className="text-xs font-semibold text-slate-600 dark:text-slate-400">Filter Topic:</span>
                           <select
                             value={conceptFilter}
                             onChange={(e) => {
@@ -2983,7 +3195,7 @@ export default function FeynmanArena({
                               setSelectedOption(null);
                               setQuizCompleted(false);
                             }}
-                            className="bg-[#030312] border border-[#18183c] text-xs text-slate-200 rounded-lg px-3 py-1.5 font-medium focus:outline-none focus:border-purple-500"
+                            className="bg-slate-50 dark:bg-[#080814] border border-slate-200 dark:border-white/10 text-xs text-slate-800 dark:text-slate-200 rounded-lg px-3 py-1.5 font-medium focus:outline-none focus:border-violet-500 cursor-pointer"
                           >
                             <option value="all">All Upload Concepts ({flashcards.length})</option>
                             {concepts.map(c => (
@@ -2995,13 +3207,13 @@ export default function FeynmanArena({
                         </div>
 
                         {/* Deck Stats & Action Controls */}
-                        <div className="flex items-center space-x-4 text-xs">
-                          <div className="flex items-center space-x-3 bg-[#030312] border border-[#18183c] px-3 py-1.5 rounded-lg">
-                            <span className="text-emerald-400 font-bold flex items-center gap-1">
+                        <div className="flex items-center space-x-3 text-xs">
+                          <div className="flex items-center space-x-3 bg-slate-50 dark:bg-[#080814] border border-slate-200/90 dark:border-white/[0.08] px-3 py-1.5 rounded-lg tabular-nums">
+                            <span className="text-emerald-600 dark:text-emerald-400 font-semibold flex items-center gap-1">
                               <Check className="w-3.5 h-3.5" /> {masteredCount} Mastered
                             </span>
-                            <span className="text-slate-600">|</span>
-                            <span className="text-rose-400 font-bold flex items-center gap-1">
+                            <span className="text-slate-300 dark:text-slate-700">|</span>
+                            <span className="text-rose-600 dark:text-rose-400 font-semibold flex items-center gap-1">
                               <X className="w-3.5 h-3.5" /> {reviewCount} Review
                             </span>
                           </div>
@@ -3009,7 +3221,7 @@ export default function FeynmanArena({
                           <button
                             onClick={handleShuffle}
                             title="Shuffle card deck"
-                            className="p-2 rounded-lg bg-[#030312] border border-[#18183c] text-slate-400 hover:text-white hover:border-purple-500/50 transition-all cursor-pointer"
+                            className="p-2 rounded-lg bg-slate-50 dark:bg-[#080814] border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:border-violet-400 transition-all cursor-pointer"
                           >
                             <Shuffle className="w-4 h-4" />
                           </button>
@@ -3017,7 +3229,7 @@ export default function FeynmanArena({
                           <button
                             onClick={handleResetQuiz}
                             title="Restart quiz"
-                            className="p-2 rounded-lg bg-[#030312] border border-[#18183c] text-slate-400 hover:text-white hover:border-purple-500/50 transition-all cursor-pointer"
+                            className="p-2 rounded-lg bg-slate-50 dark:bg-[#080814] border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:border-violet-400 transition-all cursor-pointer"
                           >
                             <RotateCcw className="w-4 h-4" />
                           </button>
@@ -3027,18 +3239,18 @@ export default function FeynmanArena({
 
                       {/* Main Flashcard Display Area */}
                       {filteredCards.length === 0 ? (
-                        <div className="flex-1 min-h-[350px] bg-[#05051b]/45 border border-[#1b1b42]/70 rounded-xl p-8 flex flex-col items-center justify-center text-center space-y-4">
-                          <Layers className="w-10 h-10 text-purple-400 animate-pulse" />
-                          <h4 className="text-sm font-bold text-slate-200">No flashcards found for this selection</h4>
-                          <p className="text-xs text-slate-400 max-w-sm leading-relaxed">
+                        <div className="flex-1 min-h-[350px] bg-white dark:bg-[#0E0E1D] border border-slate-200/90 dark:border-white/[0.08] rounded-2xl p-8 flex flex-col items-center justify-center text-center space-y-4 shadow-xs">
+                          <Layers className="w-10 h-10 text-violet-600 dark:text-violet-400" />
+                          <h4 className="text-sm font-bold text-slate-900 dark:text-slate-100">No flashcards found for this selection</h4>
+                          <p className="text-xs text-slate-500 dark:text-slate-400 max-w-sm leading-relaxed">
                             Generate AI flashcards directly from your uploaded document or choose "All Upload Concepts".
                           </p>
                           <button
                             onClick={handleGenerateAiFlashcards}
                             disabled={loadingFlashcards}
-                            className="px-5 py-2.5 rounded-xl bg-[#1e0e28] border border-[#d946ef]/60 text-xs font-bold text-white hover:bg-[#2c123b] transition-all flex items-center space-x-2 cursor-pointer shadow-[0_0_12px_rgba(217,70,239,0.15)]"
+                            className="px-5 py-2.5 rounded-xl bg-violet-600 hover:bg-violet-700 text-xs font-semibold text-white transition-all flex items-center space-x-2 cursor-pointer shadow-xs"
                           >
-                            <Sparkles className="w-4 h-4 text-purple-300" />
+                            <Sparkles className="w-4 h-4" />
                             <span>Generate AI Flashcards Deck</span>
                           </button>
                         </div>
@@ -3047,47 +3259,47 @@ export default function FeynmanArena({
                         <motion.div
                           initial={{ opacity: 0, scale: 0.96 }}
                           animate={{ opacity: 1, scale: 1 }}
-                          className="flex-1 min-h-[380px] bg-[#05051b]/45 border border-[#1b1b42]/70 rounded-xl p-8 flex flex-col items-center justify-center text-center space-y-6"
+                          className="flex-1 min-h-[380px] bg-white dark:bg-[#0E0E1D] border border-slate-200/90 dark:border-white/[0.08] rounded-2xl p-8 flex flex-col items-center justify-center text-center space-y-6 shadow-xs"
                         >
-                          <div className="w-16 h-16 rounded-full bg-purple-950/60 border border-purple-500/50 flex items-center justify-center shadow-[0_0_20px_rgba(217,70,239,0.25)]">
-                            <Award className="w-8 h-8 text-[#d946ef]" />
+                          <div className="w-16 h-16 rounded-2xl bg-violet-50 dark:bg-violet-500/15 border border-violet-200 dark:border-violet-500/30 flex items-center justify-center">
+                            <Award className="w-8 h-8 text-violet-600 dark:text-violet-400" />
                           </div>
 
-                          <div className="space-y-2">
-                            <h3 className="text-lg font-extrabold text-white">Flashcard Quiz Completed!</h3>
-                            <p className="text-xs text-slate-400">
-                              Great job practicing concepts from <span className="text-purple-300 font-bold">{file.name}</span>!
+                          <div className="space-y-1.5">
+                            <h3 className="text-lg font-bold text-slate-900 dark:text-white">Flashcard Quiz Completed</h3>
+                            <p className="text-xs text-slate-500 dark:text-slate-400">
+                              Great job practicing concepts from <span className="text-violet-600 dark:text-violet-400 font-semibold">{file.name}</span>.
                             </p>
                           </div>
 
-                          {/* Results Score Pill */}
-                          <div className="grid grid-cols-3 gap-4 w-full max-w-md bg-[#030310]/80 border border-[#18183c] rounded-xl p-4">
+                          {/* Results Score */}
+                          <div className="grid grid-cols-3 gap-4 w-full max-w-md bg-slate-50 dark:bg-[#080814] border border-slate-200 dark:border-white/[0.08] rounded-xl p-4 tabular-nums">
                             <div>
-                              <div className="text-xl font-black text-emerald-400">{masteredCount}</div>
-                              <div className="text-[10px] text-slate-450 uppercase font-bold tracking-wider mt-1">Mastered</div>
+                              <div className="text-xl font-bold text-emerald-600 dark:text-emerald-400">{masteredCount}</div>
+                              <div className="text-[11px] text-slate-500 dark:text-slate-400 font-semibold mt-1">Mastered</div>
                             </div>
                             <div>
-                              <div className="text-xl font-black text-rose-400">{reviewCount}</div>
-                              <div className="text-[10px] text-slate-450 uppercase font-bold tracking-wider mt-1">Need Review</div>
+                              <div className="text-xl font-bold text-rose-600 dark:text-rose-400">{reviewCount}</div>
+                              <div className="text-[11px] text-slate-500 dark:text-slate-400 font-semibold mt-1">Need Review</div>
                             </div>
                             <div>
-                              <div className="text-xl font-black text-purple-300">{accuracyPct}%</div>
-                              <div className="text-[10px] text-slate-450 uppercase font-bold tracking-wider mt-1">Accuracy</div>
+                              <div className="text-xl font-bold text-violet-600 dark:text-violet-300">{accuracyPct}%</div>
+                              <div className="text-[11px] text-slate-500 dark:text-slate-400 font-semibold mt-1">Accuracy</div>
                             </div>
                           </div>
 
                           <div className="flex items-center space-x-3 pt-2">
                             <button
                               onClick={handleResetQuiz}
-                              className="px-5 py-2.5 rounded-xl bg-[#1e0e28] border border-[#d946ef]/60 text-xs font-bold text-white hover:bg-[#2c123b] transition-all flex items-center space-x-2 cursor-pointer"
+                              className="px-5 py-2.5 rounded-xl bg-violet-600 hover:bg-violet-700 text-xs font-semibold text-white transition-all flex items-center space-x-2 cursor-pointer shadow-xs"
                             >
-                              <RotateCcw className="w-4 h-4 text-purple-300" />
+                              <RotateCcw className="w-4 h-4" />
                               <span>Restart Quiz</span>
                             </button>
 
                             <button
                               onClick={() => setMapSubView("orbit")}
-                              className="px-5 py-2.5 rounded-xl bg-[#030312] border border-[#18183c] text-xs font-bold text-slate-300 hover:text-white hover:border-purple-500/50 transition-all cursor-pointer"
+                              className="px-5 py-2.5 rounded-xl bg-white dark:bg-white/[0.04] border border-slate-200 dark:border-white/10 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-white/[0.08] transition-all cursor-pointer"
                             >
                               <span>Back to Concept Map</span>
                             </button>
@@ -3097,21 +3309,18 @@ export default function FeynmanArena({
                         /* Active Flashcard View */
                         <div className="flex-1 flex flex-col items-center justify-center space-y-5 min-h-[440px]">
                           
-                          {/* Card Counter & Concept Header */}
-                          <div className="flex items-center justify-between w-full max-w-xl text-xs px-2">
-                            <span className="font-mono text-slate-400 font-bold">
-                              Card <span className="text-purple-400">{currentCardIndex + 1}</span> of {filteredCards.length}
+                          {/* Card Counter & Concept Metadata */}
+                          <div className="flex items-center justify-between w-full max-w-xl text-xs px-1">
+                            <span className="font-mono text-slate-500 dark:text-slate-400 font-semibold tabular-nums">
+                              Card <span className="text-violet-600 dark:text-violet-400">{currentCardIndex + 1}</span> of {filteredCards.length}
                             </span>
-                            <div className="flex items-center space-x-2">
-                              <span className="text-[10px] font-mono uppercase tracking-wider text-purple-300 bg-purple-950/40 px-2.5 py-0.5 rounded-full border border-purple-500/30">
+                            <div className="flex items-center space-x-2 text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                              <span className="text-slate-700 dark:text-slate-300 font-semibold truncate max-w-[200px]">
                                 {currentCard?.conceptTitle}
                               </span>
-                              <span className={`text-[9px] font-mono font-bold px-2 py-0.5 rounded uppercase border ${
-                                currentCard?.cardType === "fill_blank"
-                                  ? "bg-indigo-950/40 border-indigo-500/40 text-indigo-300"
-                                  : "bg-purple-950/40 border-purple-500/40 text-purple-300"
-                              }`}>
-                                {currentCard?.cardType === "fill_blank" ? "Fill in the Blank" : "MCQ"}
+                              <span>·</span>
+                              <span className="text-violet-600 dark:text-violet-400 font-mono font-semibold uppercase">
+                                {currentCard?.cardType === "fill_blank" ? "Fill Blank" : "MCQ"}
                               </span>
                             </div>
                           </div>
@@ -3127,30 +3336,30 @@ export default function FeynmanArena({
                               {/* FRONT SIDE */}
                               <div 
                                 style={{ backfaceVisibility: "hidden" }}
-                                className="absolute inset-0 w-full h-full bg-[#060622]/95 border border-[#1c1c48] rounded-2xl p-6 flex flex-col justify-between shadow-2xl overflow-y-auto"
+                                className="absolute inset-0 w-full h-full bg-white dark:bg-[#0E0E1D] border border-slate-200/90 dark:border-white/[0.08] rounded-2xl p-6 flex flex-col justify-between shadow-lg dark:shadow-2xl overflow-y-auto"
                               >
                                 {/* Header */}
-                                <div className="flex justify-between items-center border-b border-[#18183c] pb-3">
-                                  <span className="text-[10px] font-mono uppercase tracking-widest text-slate-400 flex items-center gap-1.5">
+                                <div className="flex justify-between items-center border-b border-slate-200/80 dark:border-white/[0.07] pb-3">
+                                  <span className="text-[11px] font-mono uppercase tracking-wider text-slate-500 dark:text-slate-400 flex items-center gap-1.5">
                                     {currentCard?.cardType === "fill_blank" ? (
                                       <>
-                                        <BookOpen className="w-3.5 h-3.5 text-indigo-400" />
-                                        <span>Fill in the Blank Question</span>
+                                        <BookOpen className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
+                                        <span>Fill in the Blank</span>
                                       </>
                                     ) : (
                                       <>
-                                        <Sliders className="w-3.5 h-3.5 text-purple-400" />
-                                        <span>Multiple Choice Question</span>
+                                        <Sliders className="w-3.5 h-3.5 text-violet-600 dark:text-violet-400" />
+                                        <span>Multiple Choice</span>
                                       </>
                                     )}
                                   </span>
                                   {currentCard?.difficulty && (
-                                    <span className={`text-[9px] font-mono font-bold px-2 py-0.5 rounded border uppercase ${
+                                    <span className={`text-[10px] font-mono font-semibold uppercase ${
                                       currentCard.difficulty === "Hard"
-                                        ? "bg-rose-955/20 border-rose-800/40 text-rose-300"
+                                        ? "text-rose-600 dark:text-rose-400"
                                         : currentCard.difficulty === "Medium"
-                                        ? "bg-amber-955/20 border-amber-800/40 text-amber-300"
-                                        : "bg-emerald-955/20 border-emerald-800/40 text-emerald-300"
+                                        ? "text-amber-600 dark:text-amber-400"
+                                        : "text-emerald-600 dark:text-emerald-400"
                                     }`}>
                                       {currentCard.difficulty}
                                     </span>
@@ -3160,11 +3369,11 @@ export default function FeynmanArena({
                                 {/* Question Content */}
                                 <div className="my-auto space-y-4 py-2">
                                   {currentCard?.cardType === "fill_blank" ? (
-                                    <h3 className="text-base sm:text-lg font-bold text-white leading-relaxed">
+                                    <h3 className="text-base sm:text-lg font-bold text-slate-900 dark:text-white leading-relaxed">
                                       {currentCard?.question.includes("___") ? (
                                         <>
                                           {currentCard.question.split("___")[0]}
-                                          <span className="inline-block px-3 py-0.5 my-0.5 mx-1.5 rounded-lg bg-indigo-950/80 border border-indigo-500/60 text-indigo-200 font-mono text-sm underline decoration-indigo-400 decoration-dashed">
+                                          <span className="inline-block px-3 py-0.5 my-0.5 mx-1.5 rounded-lg bg-violet-50 dark:bg-indigo-950/80 border border-violet-300 dark:border-indigo-500/60 text-violet-700 dark:text-indigo-200 font-mono text-sm underline decoration-violet-400 decoration-dashed">
                                             {selectedOption || "__________"}
                                           </span>
                                           {currentCard.question.split("___")[1]}
@@ -3174,7 +3383,7 @@ export default function FeynmanArena({
                                       )}
                                     </h3>
                                   ) : (
-                                    <h3 className="text-base sm:text-lg font-bold text-white leading-relaxed">
+                                    <h3 className="text-base sm:text-lg font-bold text-slate-900 dark:text-white leading-relaxed">
                                       {currentCard?.question}
                                     </h3>
                                   )}
@@ -3184,9 +3393,9 @@ export default function FeynmanArena({
                                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 mt-3.5">
                                       {currentCard.options.map((opt, oIdx) => {
                                         const isSelected = selectedOption === opt;
-                                        let btnStyle = "bg-[#030314] border-[#18183c] text-slate-300 hover:border-purple-500/60 hover:text-white hover:bg-[#070724]";
+                                        let btnStyle = "bg-slate-50 dark:bg-[#080814] border-slate-200 dark:border-white/[0.08] text-slate-700 dark:text-slate-300 hover:border-violet-400 dark:hover:border-violet-500/60 hover:text-slate-900 dark:hover:text-white";
                                         if (isSelected) {
-                                          btnStyle = "bg-purple-950/70 border-purple-500 text-purple-100 shadow-[0_0_12px_rgba(217,70,239,0.25)]";
+                                          btnStyle = "bg-violet-50 dark:bg-violet-500/20 border-violet-500 text-violet-900 dark:text-violet-100 shadow-xs";
                                         }
                                         return (
                                           <button
@@ -3198,14 +3407,14 @@ export default function FeynmanArena({
                                             className={`p-3 rounded-xl border text-xs text-left transition-all cursor-pointer flex items-center justify-between gap-2 min-h-[44px] ${btnStyle}`}
                                           >
                                             <span className="flex items-center space-x-2.5">
-                                              <span className="font-mono text-[11px] font-bold text-slate-500 shrink-0">
+                                              <span className="font-mono text-[11px] font-semibold text-slate-400 dark:text-slate-500 shrink-0">
                                                 {String.fromCharCode(65 + oIdx)}.
                                               </span>
-                                              <span className="font-bold text-xs sm:text-sm leading-snug break-words">
+                                              <span className="font-semibold text-xs sm:text-sm leading-snug break-words">
                                                 {opt}
                                               </span>
                                             </span>
-                                            {isSelected && <Check className="w-4 h-4 text-purple-400 shrink-0 ml-1" />}
+                                            {isSelected && <Check className="w-4 h-4 text-violet-600 dark:text-violet-400 shrink-0 ml-1" />}
                                           </button>
                                         );
                                       })}
@@ -3214,20 +3423,20 @@ export default function FeynmanArena({
                                 </div>
 
                                 {/* Footer Action */}
-                                <div className="pt-3 border-t border-[#18183c]/60 flex items-center justify-between text-[10px]">
-                                  <span className="text-slate-500 flex items-center gap-1">
-                                    <RotateCw className="w-3 h-3 text-purple-400" />
-                                    <span>Select option then flip card to check answer & explanation</span>
+                                <div className="pt-3 border-t border-slate-200/80 dark:border-white/[0.07] flex items-center justify-between text-[11px]">
+                                  <span className="text-slate-500 dark:text-slate-400 flex items-center gap-1.5">
+                                    <RotateCw className="w-3 h-3 text-violet-600 dark:text-violet-400" />
+                                    <span>Select an option then check answer</span>
                                   </span>
                                   <button
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       setIsCardFlipped(true);
                                     }}
-                                    className="px-3.5 py-1.5 rounded-lg bg-purple-900/50 hover:bg-purple-800/70 border border-purple-500/50 text-purple-100 text-xs font-bold transition-all cursor-pointer flex items-center space-x-1"
+                                    className="px-3.5 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold transition-all cursor-pointer flex items-center space-x-1.5 shadow-xs whitespace-nowrap"
                                   >
                                     <span>Check Answer</span>
-                                    <Sparkles className="w-3 h-3 text-purple-300" />
+                                    <Sparkles className="w-3 h-3" />
                                   </button>
                                 </div>
                               </div>
@@ -3235,19 +3444,19 @@ export default function FeynmanArena({
                               {/* BACK SIDE */}
                               <div 
                                 style={{ backfaceVisibility: "hidden", transform: "rotateY(180deg)" }}
-                                className="absolute inset-0 w-full h-full bg-[#0d0722]/95 border border-[#d946ef]/40 rounded-2xl p-6 flex flex-col justify-between shadow-2xl overflow-y-auto"
+                                className="absolute inset-0 w-full h-full bg-white dark:bg-[#0E0E1D] border border-violet-300 dark:border-violet-500/40 rounded-2xl p-6 flex flex-col justify-between shadow-lg dark:shadow-2xl overflow-y-auto"
                               >
                                 {/* Header */}
-                                <div className="flex justify-between items-center border-b border-purple-900/40 pb-3">
-                                  <span className="text-[10px] font-mono uppercase tracking-widest text-purple-300 flex items-center gap-1.5">
-                                    <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
-                                    <span>Answer Breakdown & Explanation</span>
+                                <div className="flex justify-between items-center border-b border-slate-200/80 dark:border-white/[0.07] pb-3">
+                                  <span className="text-[11px] font-mono uppercase tracking-wider text-violet-700 dark:text-violet-300 flex items-center gap-1.5">
+                                    <CheckCircle className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                                    <span>Answer Breakdown</span>
                                   </span>
-                                  <span className="text-[10px] text-slate-400 font-mono">{currentCard?.conceptTitle}</span>
+                                  <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono truncate max-w-[180px]">{currentCard?.conceptTitle}</span>
                                 </div>
 
                                 {/* Result & Explanation Sections */}
-                                <div className="my-auto space-y-3.5 py-2">
+                                <div className="my-auto space-y-3 py-2">
                                   
                                   {/* Result Banner */}
                                   {selectedOption ? (() => {
@@ -3255,13 +3464,13 @@ export default function FeynmanArena({
                                     return (
                                       <div className={`p-3 rounded-xl border flex items-start space-x-2.5 ${
                                         isCorrect
-                                          ? "bg-emerald-950/40 border-emerald-500/50 text-emerald-200"
-                                          : "bg-rose-950/40 border-rose-500/50 text-rose-200"
+                                          ? "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-500/40 text-emerald-900 dark:text-emerald-200"
+                                          : "bg-rose-50 dark:bg-rose-950/40 border-rose-200 dark:border-rose-500/40 text-rose-900 dark:text-rose-200"
                                       }`}>
                                         {isCorrect ? (
-                                          <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                                          <CheckCircle className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
                                         ) : (
-                                          <X className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                                          <X className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
                                         )}
                                         <div className="text-xs space-y-0.5">
                                           <div className="font-bold">
@@ -3270,39 +3479,39 @@ export default function FeynmanArena({
                                           <div className="text-[11px] opacity-90">
                                             {isCorrect
                                               ? `You correctly selected: "${currentCard?.answer}"`
-                                              : `Your pick: "${selectedOption}" • Correct Answer: "${currentCard?.answer}"`}
+                                              : `Your pick: "${selectedOption}" · Correct Answer: "${currentCard?.answer}"`}
                                           </div>
                                         </div>
                                       </div>
                                     );
                                   })() : (
-                                    <div className="p-3 rounded-xl bg-purple-950/40 border border-purple-500/30 text-purple-200 flex items-start space-x-2.5">
-                                      <Sparkles className="w-4 h-4 text-purple-400 shrink-0 mt-0.5" />
+                                    <div className="p-3 rounded-xl bg-violet-50 dark:bg-violet-950/40 border border-violet-200 dark:border-violet-500/30 text-violet-900 dark:text-violet-200 flex items-start space-x-2.5">
+                                      <Sparkles className="w-4 h-4 text-violet-600 dark:text-violet-400 shrink-0 mt-0.5" />
                                       <div className="text-xs space-y-0.5">
-                                        <div className="font-bold">Correct Answer</div>
-                                        <div className="text-sm font-black text-white">{currentCard?.answer}</div>
+                                        <div className="font-semibold">Correct Answer</div>
+                                        <div className="text-sm font-bold text-slate-900 dark:text-white">{currentCard?.answer}</div>
                                       </div>
                                     </div>
                                   )}
 
                                   {/* EXPLAIN WHY SECTION */}
-                                  <div className="p-3 bg-[#04041a] border border-[#1b1b48] rounded-xl space-y-1">
-                                    <div className="text-[10px] font-mono font-bold uppercase text-purple-400 flex items-center gap-1.5">
-                                      <HelpCircle className="w-3.5 h-3.5 text-purple-300" />
+                                  <div className="p-3 bg-slate-50 dark:bg-[#080814] border border-slate-200/80 dark:border-white/[0.07] rounded-xl space-y-1">
+                                    <div className="text-[10px] font-mono font-semibold uppercase text-violet-600 dark:text-violet-400 flex items-center gap-1.5">
+                                      <HelpCircle className="w-3.5 h-3.5" />
                                       <span>Why is this answer correct?</span>
                                     </div>
-                                    <p className="text-xs text-slate-200 leading-relaxed font-medium">
+                                    <p className="text-xs text-slate-700 dark:text-slate-200 leading-relaxed font-medium">
                                       {currentCard?.explainWhy || currentCard?.explanation || "This answer directly matches the definition and principles detailed in your uploaded document."}
                                     </p>
                                   </div>
 
                                   {/* WHAT ABOUT THE ANSWER SECTION */}
-                                  <div className="p-3 bg-[#04041a] border border-[#1b1b48] rounded-xl space-y-1">
-                                    <div className="text-[10px] font-mono font-bold uppercase text-indigo-400 flex items-center gap-1.5">
-                                      <BookOpen className="w-3.5 h-3.5 text-indigo-300" />
+                                  <div className="p-3 bg-slate-50 dark:bg-[#080814] border border-slate-200/80 dark:border-white/[0.07] rounded-xl space-y-1">
+                                    <div className="text-[10px] font-mono font-semibold uppercase text-indigo-600 dark:text-indigo-400 flex items-center gap-1.5">
+                                      <BookOpen className="w-3.5 h-3.5" />
                                       <span>What about this concept?</span>
                                     </div>
-                                    <p className="text-xs text-slate-300 leading-relaxed font-normal">
+                                    <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
                                       {currentCard?.whatAbout || `This subtopic (${currentCard?.conceptTitle}) represents a key element of the subject material. Reviewing this concept strengthens your overall topic retention.`}
                                     </p>
                                   </div>
@@ -3310,21 +3519,21 @@ export default function FeynmanArena({
                                 </div>
 
                                 {/* Rating Bar */}
-                                <div className="pt-3 border-t border-purple-900/40 flex items-center justify-between gap-3">
+                                <div className="pt-3 border-t border-slate-200/80 dark:border-white/[0.07] flex items-center justify-between gap-3">
                                   <button
                                     onClick={() => handleRateCard(false)}
-                                    className="flex-1 py-2 px-3 rounded-xl bg-rose-950/30 border border-rose-500/40 text-rose-300 hover:bg-rose-900/40 transition-all text-xs font-bold flex items-center justify-center space-x-1.5 cursor-pointer"
+                                    className="flex-1 py-2 px-3 rounded-xl bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-500/40 text-rose-700 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/40 transition-all text-xs font-semibold flex items-center justify-center space-x-1.5 cursor-pointer"
                                   >
-                                    <X className="w-3.5 h-3.5 text-rose-400" />
+                                    <X className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
                                     <span>Needs Review</span>
                                   </button>
 
                                   <button
                                     onClick={() => handleRateCard(true)}
-                                    className="flex-1 py-2 px-3 rounded-xl bg-emerald-950/30 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-900/40 transition-all text-xs font-bold flex items-center justify-center space-x-1.5 cursor-pointer"
+                                    className="flex-1 py-2 px-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-500/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/40 transition-all text-xs font-semibold flex items-center justify-center space-x-1.5 cursor-pointer"
                                   >
-                                    <Check className="w-3.5 h-3.5 text-emerald-400" />
-                                    <span>Mastered It!</span>
+                                    <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                                    <span>Mastered It</span>
                                   </button>
                                 </div>
 
@@ -3334,27 +3543,27 @@ export default function FeynmanArena({
                           </div>
 
                           {/* Navigation Controls */}
-                          <div className="flex items-center space-x-4">
+                          <div className="flex items-center space-x-3">
                             <button
                               onClick={handlePrevCard}
                               disabled={currentCardIndex === 0}
-                              className="px-4 py-2 rounded-xl bg-[#030312] border border-[#18183c] text-xs font-bold text-slate-300 hover:text-white disabled:opacity-40 transition-all cursor-pointer"
+                              className="px-4 py-2 rounded-xl bg-white dark:bg-white/[0.04] border border-slate-200 dark:border-white/10 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-white/[0.08] disabled:opacity-40 transition-all cursor-pointer"
                             >
                               Previous
                             </button>
 
                             <button
                               onClick={() => setIsCardFlipped(!isCardFlipped)}
-                              className="px-5 py-2 rounded-xl bg-[#1e0e28] border border-[#d946ef]/60 text-xs font-bold text-purple-200 hover:text-white hover:bg-[#2c123b] transition-all flex items-center space-x-1.5 cursor-pointer"
+                              className="px-5 py-2 rounded-xl bg-violet-600 hover:bg-violet-700 text-xs font-semibold text-white transition-all flex items-center space-x-1.5 cursor-pointer shadow-xs"
                             >
-                              <RotateCw className="w-3.5 h-3.5 text-purple-300" />
+                              <RotateCw className="w-3.5 h-3.5" />
                               <span>{isCardFlipped ? "View Question" : "Flip Card"}</span>
                             </button>
 
                             <button
                               onClick={handleNextCard}
                               disabled={currentCardIndex === filteredCards.length - 1}
-                              className="px-4 py-2 rounded-xl bg-[#030312] border border-[#18183c] text-xs font-bold text-slate-300 hover:text-white disabled:opacity-40 transition-all cursor-pointer"
+                              className="px-4 py-2 rounded-xl bg-white dark:bg-white/[0.04] border border-slate-200 dark:border-white/10 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-white/[0.08] disabled:opacity-40 transition-all cursor-pointer"
                             >
                               Next
                             </button>
@@ -3458,11 +3667,11 @@ export default function FeynmanArena({
             };
 
             const heatmapColors = [
-              "bg-[#070720]/75 border border-[#1b1b42]/30", // L0: Empty dark
-              "bg-purple-950/30 border border-purple-900/20", // L1: Faint Purple
-              "bg-purple-800/40 border border-purple-700/30", // L2: Moderate Purple
-              "bg-[#d946ef]/45 border border-[#d946ef]/25", // L3: Rich Pink-Purple
-              "bg-[#d946ef] shadow-[0_0_8px_rgba(217,70,239,0.5)] border border-white/20" // L4: Radiant Hotspot
+              "bg-slate-100 dark:bg-white/[0.04] border border-slate-200/80 dark:border-white/[0.06]", // L0: Empty
+              "bg-violet-100 dark:bg-violet-950/50 border border-violet-200 dark:border-violet-800/30", // L1: Faint
+              "bg-violet-300 dark:bg-violet-800/60 border border-violet-300 dark:border-violet-700/40", // L2: Moderate
+              "bg-violet-500 dark:bg-fuchsia-500/60 border border-violet-500/40 dark:border-fuchsia-400/30", // L3: Rich
+              "bg-violet-600 dark:bg-fuchsia-500 border border-violet-700/30 dark:border-white/20" // L4: High
             ];
 
             // Formatted active timer: shows seconds live so it visibly updates second-by-second
@@ -3490,63 +3699,63 @@ export default function FeynmanArena({
                 className="max-w-4xl mx-auto w-full flex-1 flex flex-col space-y-6 pb-10"
                 id="details-progress-banner"
               >
-                {/* Clean Top Stat Card deck layout from screenshot */}
+                {/* Clean Top Stat Card deck layout */}
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4" id="progress-stats-deck">
 
                   {/* Card 1: Topics Mastered */}
-                  <div className="rounded-xl border border-[#1b1b42]/60 bg-[#06061d]/40 p-4 flex flex-col justify-between" id="card-topics-mastered">
-                    <span className="text-xs font-bold text-slate-400 capitalize tracking-tight">Topics mastered</span>
+                  <div className="rounded-2xl border border-slate-200/90 dark:border-white/[0.08] bg-white dark:bg-[#0E0E1D] p-5 flex flex-col justify-between shadow-xs" id="card-topics-mastered">
+                    <span className="text-xs font-semibold text-slate-500 dark:text-slate-400 tracking-tight">Topics mastered</span>
                     <div className="my-3" id="inner-topics-display">
-                      <span className="text-3.5xl font-black text-white" style={{ fontFamily: "'Space Grotesk', system-ui, sans-serif" }}>
+                      <span className="text-3xl font-bold text-slate-900 dark:text-white tabular-nums tracking-tight">
                         {completedConceptsCount}
                       </span>
                     </div>
-                    <span className="text-[10px] text-slate-500 font-semibold font-mono">
+                    <span className="text-[11px] text-slate-500 dark:text-slate-400 font-medium font-mono tabular-nums">
                       of {totalConceptsCount} total
                     </span>
                   </div>
 
                   {/* Card 2: Avg Mastery */}
-                  <div className="rounded-xl border border-[#1b1b42]/60 bg-[#06061d]/40 p-4 flex flex-col justify-between" id="card-avg-mastery">
-                    <span className="text-xs font-bold text-slate-400 capitalize tracking-tight">Avg mastery</span>
+                  <div className="rounded-2xl border border-slate-200/90 dark:border-white/[0.08] bg-white dark:bg-[#0E0E1D] p-5 flex flex-col justify-between shadow-xs" id="card-avg-mastery">
+                    <span className="text-xs font-semibold text-slate-500 dark:text-slate-400 tracking-tight">Avg mastery</span>
                     <div className="my-3" id="inner-mastery-display">
-                      <span className="text-3.5xl font-black text-white" style={{ fontFamily: "'Space Grotesk', system-ui, sans-serif" }}>
+                      <span className="text-3xl font-bold text-slate-900 dark:text-white tabular-nums tracking-tight">
                         {computedAvgMastery}%
                       </span>
                     </div>
-                    <span className="text-[10px] text-slate-500 font-semibold font-mono">across all topics</span>
+                    <span className="text-[11px] text-slate-500 dark:text-slate-400 font-medium font-mono">across all topics</span>
                   </div>
 
-                  {/* Card 3: Time This Week */}
-                  <div className="rounded-xl border border-[#1b1b42]/60 bg-[#06061d]/40 p-4 flex flex-col justify-between" id="card-study-time">
-                    <span className="text-xs font-bold text-slate-400 capitalize tracking-tight">Time studied</span>
+                  {/* Card 3: Time Studied */}
+                  <div className="rounded-2xl border border-slate-200/90 dark:border-white/[0.08] bg-white dark:bg-[#0E0E1D] p-5 flex flex-col justify-between shadow-xs" id="card-study-time">
+                    <span className="text-xs font-semibold text-slate-500 dark:text-slate-400 tracking-tight">Time studied</span>
                     <div className="my-3" id="inner-time-display">
-                      <span className="text-3.5xl font-black text-white py-0.5" style={{ fontFamily: "'Space Grotesk', system-ui, sans-serif" }}>{formattedTime}</span>
+                      <span className="text-3xl font-bold text-slate-900 dark:text-white tabular-nums tracking-tight">{formattedTime}</span>
                     </div>
-                    <span className="text-[10px] text-emerald-400/90 font-bold font-mono">
-                      +{studySeconds > 60 ? Math.round(studySeconds / 60) : 1} min elapsed
+                    <span className="text-[11px] text-emerald-600 dark:text-emerald-400 font-semibold font-mono tabular-nums">
+                      +{studySeconds > 60 ? Math.round(studySeconds / 60) : 1} min elapsed · {realStreak}d streak
                     </span>
                   </div>
 
                 </div>
 
-                {/* Bottom 26-week activity heatmap container (styled beautifully inside our theme) */}
+                {/* Bottom 26-week activity heatmap container */}
                 <div 
-                  className="rounded-2xl border border-[#1b1b42]/50 bg-[#05051b]/45 p-6 space-y-4 shadow-[0_4px_24px_rgba(30,14,40,0.2)]" 
+                  className="rounded-2xl border border-slate-200/90 dark:border-white/[0.08] bg-white dark:bg-[#0E0E1D] p-6 space-y-4 shadow-xs" 
                   id="progress-activity-heatmap-card"
                 >
-                  <h4 className="text-sm font-bold text-slate-300 tracking-tight" id="activity-heatmap-title">
+                  <h4 className="text-sm font-bold text-slate-900 dark:text-slate-100 tracking-tight" id="activity-heatmap-title">
                     Activity — last 26 weeks
                   </h4>
 
                   {/* Horizontal Scrollable Heatmap Wrap */}
-                  <div className="overflow-x-auto pb-2 scrollbar-thin scrollbar-thumb-purple-950 scrollbar-track-transparent select-none" id="heatmap-overflow-container">
+                  <div className="overflow-x-auto pb-2 select-none" id="heatmap-overflow-container">
                     <div className="min-w-[420px] flex flex-col space-y-1" id="heatmap-grid-core">
                       {/* Generates standard 7 rows (Sunday to Saturday) */}
                       {Array.from({ length: 7 }).map((_, rIdx) => (
                         <div key={`heatmap-row-${rIdx}`} className="flex space-x-1 justify-start">
                           {/* Day marker label on left side */}
-                          <div className="w-5 text-[8px] font-mono text-slate-550 font-bold flex items-center pr-1 opacity-60">
+                          <div className="w-6 text-[9px] font-mono text-slate-400 dark:text-slate-500 font-semibold flex items-center pr-1">
                             {rIdx === 1 ? "Mon" : rIdx === 3 ? "Wed" : rIdx === 5 ? "Fri" : ""}
                           </div>
                           
@@ -3566,15 +3775,13 @@ export default function FeynmanArena({
                     </div>
                   </div>
 
-                  {/* Heatmap Legend row: aligns perfectly at the bottom */}
-                  <div className="flex justify-end items-center space-x-2 text-[10px] text-slate-500 font-mono" id="heatmap-legend">
+                  {/* Heatmap Legend row */}
+                  <div className="flex justify-end items-center space-x-2 text-[10px] text-slate-500 dark:text-slate-400 font-mono" id="heatmap-legend">
                     <span>Less</span>
                     <div className="flex space-x-1 items-center" id="legend-pills">
-                      <div className="w-2.5 h-2.5 rounded-[2px] bg-[#070720]/75 border border-[#1b1b42]/30" />
-                      <div className="w-2.5 h-2.5 rounded-[2px] bg-purple-950/30 border border-purple-900/20" />
-                      <div className="w-2.5 h-2.5 rounded-[2px] bg-purple-800/40 border border-purple-700/30" />
-                      <div className="w-2.5 h-2.5 rounded-[2px] bg-[#d946ef]/45 border border-[#d946ef]/25" />
-                      <div className="w-2.5 h-2.5 rounded-[2px] bg-[#d946ef] border border-white/20" />
+                      {heatmapColors.map((cls, idx) => (
+                        <div key={idx} className={`w-2.5 h-2.5 rounded-[2px] ${cls}`} />
+                      ))}
                     </div>
                     <span>More</span>
                   </div>
@@ -3608,65 +3815,56 @@ export default function FeynmanArena({
 
             {/* Modal Body Container */}
             <motion.div
-              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              initial={{ opacity: 0, scale: 0.96, y: 16 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              transition={{ type: "spring", duration: 0.5 }}
-              className="relative w-full max-w-2xl bg-[#05051a] border border-purple-500/25 rounded-2xl shadow-[0_0_50px_rgba(168,85,247,0.2)] overflow-hidden flex flex-col max-h-[85vh] z-10"
+              exit={{ opacity: 0, scale: 0.96, y: 16 }}
+              transition={{ type: "spring", duration: 0.4 }}
+              className="relative w-full max-w-2xl bg-white dark:bg-[#0E0E1D] border border-slate-200 dark:border-white/10 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh] z-10"
               id="source-document-body"
             >
-              {/* Corner HUD decorations */}
-              <div className="absolute top-2 left-2 w-3.5 h-3.5 border-t border-l border-purple-500/30" />
-              <div className="absolute top-2 right-2 w-3.5 h-3.5 border-t border-r border-purple-500/30" />
-              <div className="absolute bottom-2 left-2 w-3.5 h-3.5 border-b border-l border-purple-500/30" />
-              <div className="absolute bottom-2 right-2 w-3.5 h-3.5 border-b border-r border-purple-500/30" />
-
               {/* Title Header */}
-              <div className="flex items-center justify-between border-b border-purple-500/15 bg-purple-950/20 px-6 py-4.5" id="source-doc-header">
-                <div className="flex items-center space-x-2.5">
-                  <div className="w-8 h-8 rounded-lg bg-purple-950/60 border border-purple-500/30 flex items-center justify-center">
-                    <BookOpen className="w-4 h-4 text-purple-300" />
+              <div className="flex items-center justify-between border-b border-slate-200/80 dark:border-white/[0.08] bg-slate-50/80 dark:bg-white/[0.02] px-6 py-4" id="source-doc-header">
+                <div className="flex items-center space-x-3">
+                  <div className="w-8 h-8 rounded-lg bg-violet-100 dark:bg-violet-500/15 border border-violet-200 dark:border-violet-500/30 flex items-center justify-center">
+                    <BookOpen className="w-4 h-4 text-violet-600 dark:text-violet-400" />
                   </div>
                   <div>
-                    <h3 className="text-sm font-bold text-slate-100 font-sans tracking-wide">Original Reference</h3>
-                    <p className="text-[10px] font-mono font-bold tracking-wider text-purple-400 uppercase mt-0.5">Uploaded Source Material</p>
+                    <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">Original Reference</h3>
+                    <p className="text-[11px] font-mono font-semibold tracking-wider text-violet-600 dark:text-violet-400 uppercase mt-0.5">Uploaded Source Material</p>
                   </div>
                 </div>
                 <button
                   id="btn-close-source-doc"
                   onClick={() => setIsSourceDocumentOpen(false)}
-                  className="p-1.5 rounded-full hover:bg-slate-900 text-slate-400 hover:text-white transition-all cursor-pointer"
-                  title="Close custom viewer"
+                  className="p-1.5 rounded-lg hover:bg-slate-200/70 dark:hover:bg-white/[0.08] text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-all cursor-pointer"
+                  title="Close source viewer"
                 >
                   <X className="w-4 h-4" />
                 </button>
               </div>
 
               {/* Central Content Panel */}
-              <div className="p-6 overflow-y-auto flex-1 select-text scrollbar-thin scrollbar-thumb-purple-950 scrollbar-track-transparent" id="source-doc-content-pane">
-                {file.type === "application/pdf" || file.content.startsWith("data:application/pdf") ? (
+              <div className="p-6 overflow-y-auto flex-1 select-text" id="source-doc-content-pane">
+                {file.type === "application/pdf" || file.content.startsWith("data:application/pdf") || file.name.toLowerCase().endsWith(".pdf") ? (
                   <div className="flex flex-col space-y-4 w-full">
                     
-                    {/* Sandbox Alert / Action Banner */}
-                    <div className="rounded-xl border border-purple-500/25 bg-[#0a0a24]/90 p-5 relative overflow-hidden group shadow-inner">
-                      <div className="absolute top-0 right-0 w-32 h-32 bg-purple-500/5 rounded-full blur-2xl pointer-events-none" />
-                      
+                    {/* Action Banner */}
+                    <div className="rounded-xl border border-slate-200 dark:border-white/[0.08] bg-slate-50/80 dark:bg-white/[0.03] p-5 relative overflow-hidden">
                       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 relative z-10">
                         <div className="space-y-1">
-                          <h4 className="text-xs sm:text-sm font-bold text-slate-100 font-sans tracking-wide flex items-center space-x-2">
-                            <span className="w-1.5 h-1.5 rounded-full bg-purple-400 animate-pulse shrink-0" />
-                            <span>PDF Navigation Control</span>
+                          <h4 className="text-xs sm:text-sm font-bold text-slate-900 dark:text-slate-100">
+                            PDF Navigation Control
                           </h4>
-                          <p className="text-[11px] text-slate-400 font-medium leading-relaxed max-w-md">
-                            Your PDF was loaded successfully for Feynman AI analysis! Since some web browsers restrict native PDF rendering inside secure sandboxed previews, use the buttons below to open or save the file directly.
+                          <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed max-w-md">
+                            Your PDF is loaded for analysis. Scroll through pages below, or download and open the file directly.
                           </p>
                         </div>
 
-                        <div className="flex flex-row items-center gap-2.5 self-start sm:self-center">
+                        <div className="flex flex-row items-center gap-2.5 self-start sm:self-center shrink-0">
                           <a 
-                            href={file.content}
+                            href={pdfActionUrl || file.content}
                             download={file.name}
-                            className="px-4 py-2 rounded-lg bg-[#221035] border border-purple-500/40 text-[11px] font-bold text-purple-200 hover:text-white hover:bg-[#2d1449] hover:border-purple-400 transition-all duration-300 flex items-center space-x-2 cursor-pointer shadow-md shadow-purple-500/5 active:scale-98 select-none"
+                            className="px-3.5 py-2 rounded-lg bg-violet-600 hover:bg-violet-700 text-xs font-semibold text-white transition-all flex items-center space-x-1.5 cursor-pointer shadow-xs whitespace-nowrap"
                             title="Download PDF to your local machine"
                           >
                             <Download className="w-3.5 h-3.5" />
@@ -3674,10 +3872,10 @@ export default function FeynmanArena({
                           </a>
 
                           <a 
-                            href={file.content}
+                            href={pdfActionUrl || file.content}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="px-4 py-2 rounded-lg bg-slate-900 border border-slate-800 text-[11px] font-bold text-slate-300 hover:text-white hover:bg-slate-800 transition-all duration-300 flex items-center space-x-2 cursor-pointer shadow-md active:scale-98 select-none"
+                            className="px-3.5 py-2 rounded-lg bg-white dark:bg-white/[0.06] border border-slate-200 dark:border-white/10 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-white/[0.1] transition-all flex items-center space-x-1.5 cursor-pointer whitespace-nowrap"
                             title="Open original file in a new browser tab"
                           >
                             <ExternalLink className="w-3.5 h-3.5" />
@@ -3687,18 +3885,20 @@ export default function FeynmanArena({
                       </div>
                     </div>
 
-                    {/* Embed Frame */}
-                    <div className="relative h-[48vh] w-full rounded-xl overflow-hidden border border-[#2d1449]/40 bg-[#06061c]/80 shadow-[0_4px_30px_rgba(0,0,0,0.4)] flex flex-col">
-                      <iframe 
-                        src={file.content} 
-                        title={file.name} 
-                        className="w-full h-full select-none"
-                        name="feynman-pdf-viewer"
-                        id="feynman-pdf-iframe"
+                    {/* PDF.js Inline Canvas Viewer */}
+                    <div className="relative h-[48vh] w-full rounded-xl overflow-hidden border border-slate-200 dark:border-white/[0.08] bg-slate-100 dark:bg-[#080814] flex flex-col">
+                      <PdfViewer
+                        source={file.content}
+                        fileName={file.name}
+                        onResolvedUrl={setPdfActionUrl}
+                        onPageCountChange={setPdfPageCount}
                       />
-                      <div className="absolute bottom-3 left-3 right-3 bg-[#030310]/95 border border-[#1b1b42]/60 rounded-lg px-3.5 py-2.5 flex items-center justify-between text-[11px] font-mono pointer-events-auto backdrop-blur-md">
-                        <span className="text-slate-450 font-bold">📄 {file.name}</span>
-                        <span className="text-purple-400 font-bold uppercase tracking-wider">{Math.round(file.size / 1024 * 10) / 10} KB • Standard PDF</span>
+                      <div className="absolute bottom-3 left-3 right-3 bg-white/95 dark:bg-[#0E0E1D]/95 border border-slate-200 dark:border-white/10 rounded-lg px-3.5 py-2 flex items-center justify-between text-[11px] font-mono pointer-events-auto backdrop-blur-md shadow-sm">
+                        <span className="text-slate-700 dark:text-slate-300 font-semibold truncate mr-3">{file.name}</span>
+                        <span className="text-violet-600 dark:text-violet-400 font-semibold uppercase tracking-wider shrink-0 tabular-nums">
+                          {pdfPageCount ? `${pdfPageCount} ${pdfPageCount === 1 ? "PAGE" : "PAGES"} · ` : ""}
+                          {Math.round(file.size / 1024 * 10) / 10} KB · PDF
+                        </span>
                       </div>
                     </div>
 
@@ -3708,28 +3908,87 @@ export default function FeynmanArena({
                     <img 
                       src={file.content} 
                       alt={file.name} 
-                      className="max-h-[50vh] object-contain rounded-lg border border-purple-500/10 shadow-lg"
+                      className="max-h-[50vh] object-contain rounded-xl border border-slate-200 dark:border-white/10 shadow-md"
                       referrerPolicy="no-referrer"
                     />
-                    <div className="text-[11px] font-mono text-slate-500">Image format • {file.type || "Unknown type"}</div>
+                    <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400">Image format · {file.type || "Unknown type"}</div>
                   </div>
                 ) : (
                   <div className="space-y-4">
-                    <div className="text-xs text-slate-450 font-mono flex items-center justify-between border-b border-[#1b1b42]/30 pb-2.5">
-                      <span>File Size: {Math.round(file.size / 1024 * 10) / 10} KB</span>
-                      <span>Type: {file.type || "text/plain"}</span>
+                    <div className="text-xs text-slate-500 dark:text-slate-400 font-mono flex flex-wrap items-center justify-between gap-2 border-b border-slate-200/80 dark:border-white/[0.07] pb-2.5 tabular-nums">
+                      <div className="flex items-center gap-3">
+                        <span>File Size: {Math.round(file.size / 1024 * 10) / 10} KB</span>
+                        {file.pageCount ? (
+                          <span>
+                            · {file.pageCount}{" "}
+                            {file.name.toLowerCase().endsWith(".ppt") || file.name.toLowerCase().endsWith(".pptx")
+                              ? file.pageCount === 1 ? "Slide" : "Slides"
+                              : file.pageCount === 1 ? "Page" : "Pages"}
+                          </span>
+                        ) : null}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleDownloadOriginalFile}
+                        className="px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-700 text-white text-xs font-sans font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span>Download File</span>
+                      </button>
                     </div>
-                    <div className="text-slate-300 text-xs sm:text-sm font-sans whitespace-pre-wrap leading-relaxed select-text font-medium selection:bg-purple-900/40 selection:text-white">
-                      {file.content || "Empty document content uploaded."}
-                    </div>
+
+                    {file.content.startsWith("/api/rag/document/") ||
+                    file.name.toLowerCase().endsWith(".ppt") ||
+                    file.name.toLowerCase().endsWith(".pptx") ? (
+                      loadingPreview ? (
+                        <div className="py-10 flex flex-col items-center justify-center space-y-2 text-xs text-slate-500 dark:text-slate-400">
+                          <RefreshCw className="w-5 h-5 animate-spin text-violet-600 dark:text-violet-400" />
+                          <span>Loading extracted slides & sections...</span>
+                        </div>
+                      ) : previewSections.length > 0 ? (
+                        <div className="space-y-3">
+                          {previewSections.map((sec) => (
+                            <div
+                              key={sec.id}
+                              className="rounded-xl border border-slate-200/80 dark:border-white/[0.08] bg-slate-50/70 dark:bg-white/[0.03] p-4 space-y-2"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-xs font-bold text-slate-900 dark:text-slate-100">
+                                  {sec.title}
+                                </span>
+                                <span className="text-[10px] font-mono font-semibold text-violet-600 dark:text-violet-300 bg-violet-50 dark:bg-violet-500/15 px-2 py-0.5 rounded shrink-0 tabular-nums">
+                                  {sec.pageStart === sec.pageEnd
+                                    ? `${file.name.toLowerCase().endsWith(".ppt") || file.name.toLowerCase().endsWith(".pptx") ? "Slide" : "Page"} ${sec.pageStart}`
+                                    : `${file.name.toLowerCase().endsWith(".ppt") || file.name.toLowerCase().endsWith(".pptx") ? "Slides" : "Pages"} ${sec.pageStart}–${sec.pageEnd}`}
+                                </span>
+                              </div>
+                              <div className="text-slate-700 dark:text-slate-300 text-xs sm:text-sm font-sans whitespace-pre-wrap leading-relaxed select-text">
+                                {sec.text}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="py-8 text-center text-xs text-slate-500 dark:text-slate-400">
+                          {previewError ||
+                            (file.ragStage && file.ragStage !== "ready"
+                              ? "Slides are currently being indexed in the background..."
+                              : "No text preview available—click Download File above to open the original deck.")}
+                        </div>
+                      )
+                    ) : (
+                      <div className="text-slate-800 dark:text-slate-200 text-xs sm:text-sm font-sans whitespace-pre-wrap leading-relaxed select-text">
+                        {file.content || "Empty document content uploaded."}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
 
               {/* Help tip footer */}
-              <div className="bg-[#020210] border-t border-purple-500/10 px-6 py-3.5 flex justify-between items-center text-[10px] font-mono text-slate-500 font-bold tracking-wider" id="source-doc-footer">
+              <div className="bg-slate-50/80 dark:bg-white/[0.02] border-t border-slate-200/80 dark:border-white/[0.08] px-6 py-3 flex justify-between items-center text-[10px] font-mono text-slate-500 dark:text-slate-400 font-semibold tracking-wider" id="source-doc-footer">
                 <span>PRESS ESC TO CLOSE</span>
-                <span className="text-purple-400/80">FEYNMAN SOURCE VIEWER</span>
+                <span className="text-violet-600 dark:text-violet-400">FEYNMAN SOURCE VIEWER</span>
               </div>
             </motion.div>
           </div>

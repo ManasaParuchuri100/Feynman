@@ -30,7 +30,12 @@
         "fileUrl": { "type": "string" },
         "uploadedAt": { "type": "string" },
         "extractedTopicsCount": { "type": "integer" },
-        "knowledgeMap": { "type": "string" }
+        "knowledgeMap": { "type": "string" },
+        "contentHash": { "type": "string" },
+        "ragStatus": { "type": "string" },
+        "pageCount": { "type": "integer" },
+        "chunkCount": { "type": "integer" },
+        "documentOverview": { "type": "string" }
       },
       "required": ["fileName", "fileType", "fileUrl", "uploadedAt"]
     },

@@ -1,6 +1,7 @@
 import React, { useRef, useState, useEffect } from "react";
-import { Upload, Key, FileText, BookOpen, Mail, Lock, User } from "lucide-react";
+import { Upload, FileText, Mail, Lock, User, PanelLeftOpen, Sparkles } from "lucide-react";
 import { motion } from "motion/react";
+import ThemeToggle from "./ThemeToggle";
 import {
   auth,
   signInWithEmailAndPassword,
@@ -111,7 +112,6 @@ export default function MainDashboard({
         }, 1200);
       } catch (err: any) {
         setAuthStage("idle");
-        // Extrude human-friendly error messages
         let msg = err.message || "An error occurred during account creation.";
         if (err.code === "auth/email-already-in-use") {
           msg = "Email address is already registered.";
@@ -213,7 +213,6 @@ export default function MainDashboard({
     }
   };
 
-
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(true);
@@ -245,70 +244,47 @@ export default function MainDashboard({
   return (
     <div
       id="main-dashboard-container"
-      className="relative flex-1 h-screen flex flex-col items-center justify-between p-6 overflow-hidden bg-[#03030f]"
+      className="relative flex-1 h-screen flex flex-col items-center justify-between px-6 py-5 overflow-y-auto bg-[#FAFAFC] dark:bg-[#070711] text-slate-900 dark:text-slate-100 transition-colors duration-200"
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      {/* Decorative Wave Background */}
-      <div className="absolute inset-0 pointer-events-none z-0 opacity-15 overflow-hidden" id="bg-decoration">
-        <svg
-          className="absolute top-1/4 left-0 w-full h-[600px] text-purple-700/60"
-          viewBox="0 0 1440 600"
-          fill="none"
-          xmlns="http://www.w3.org/2000/svg"
-        >
-          <path
-            d="M0,192 C240,112 480,112 720,192 C960,272 1200,272 1440,192 L1440,600 L0,600 Z"
-            fill="url(#gradient-wave-1)"
-          />
-          <path
-            d="M0,320 C360,224 720,416 1080,320 C1260,272 1350,272 1440,320 L1440,600 L0,600 Z"
-            fill="url(#gradient-wave-2)"
-            opacity="0.5"
-          />
-          <defs>
-            <linearGradient id="gradient-wave-1" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor="#d946ef" stopOpacity="0.4" />
-              <stop offset="100%" stopColor="#3b0764" stopOpacity="0.0" />
-            </linearGradient>
-            <linearGradient id="gradient-wave-2" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor="#4f46e5" stopOpacity="0.3" />
-              <stop offset="100%" stopColor="#03001e" stopOpacity="0.0" />
-            </linearGradient>
-          </defs>
-        </svg>
+      {/* Subtle Architectural Backdrop Gradient */}
+      <div className="absolute inset-0 pointer-events-none z-0 overflow-hidden" id="bg-decoration">
+        <div className="absolute -top-40 left-1/2 -translate-x-1/2 w-[900px] h-[520px] rounded-full bg-gradient-to-b from-violet-200/45 via-fuchsia-100/20 to-transparent dark:from-violet-900/20 dark:via-fuchsia-900/10 dark:to-transparent blur-3xl" />
+        <div
+          className="absolute inset-0 opacity-[0.35] dark:opacity-[0.14]"
+          style={{
+            backgroundImage: "radial-gradient(circle at 1px 1px, rgba(100,116,139,0.22) 1px, transparent 0)",
+            backgroundSize: "28px 28px"
+          }}
+        />
       </div>
 
-      {/* Floating Sparkles and Orbs */}
-      <div className="absolute top-[10%] left-[15%] w-72 h-72 rounded-full bg-purple-900/10 blur-[120px] pointer-events-none z-0" />
-      <div className="absolute bottom-[10%] right-[15%] w-96 h-96 rounded-full bg-indigo-900/10 blur-[150px] pointer-events-none z-0" />
-
       {/* Header Panel */}
-      <div className="w-full relative z-10 flex items-center justify-between py-1" id="dashboard-header">
-        <div id="sidebar-toggle-trigger">
+      <header className="w-full relative z-10 flex items-center justify-between gap-4 py-1" id="dashboard-header">
+        <div id="sidebar-toggle-trigger" className="flex items-center">
           {isSidebarCollapsed && (
             <button
               id="btn-reopen-sidebar"
               onClick={onToggleSidebar}
-              className="flex items-center space-x-2 py-1.5 px-3 rounded-lg bg-slate-900/40 border border-slate-800/60 text-slate-400 hover:text-white hover:bg-slate-800/80 transition-all text-xs cursor-pointer shadow-sm hover:shadow-purple-500/10"
+              className="inline-flex items-center gap-2 py-2 px-3 rounded-lg bg-white dark:bg-white/[0.04] border border-slate-200/90 dark:border-white/[0.08] text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:border-slate-300 dark:hover:border-white/15 transition-all text-xs font-medium cursor-pointer shadow-2xs whitespace-nowrap shrink-0"
             >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
-              </svg>
-              <span>Recent Uploads</span>
+              <PanelLeftOpen className="w-4 h-4 text-violet-600 dark:text-violet-400" />
+              <span>Study Library</span>
             </button>
           )}
         </div>
 
-        <div className="flex items-center space-x-6" id="header-auth-links">
+        <div className="flex items-center gap-3 shrink-0" id="header-auth-links">
+          <ThemeToggle />
+
           {user ? (
-            <div className="flex items-center space-x-3 bg-slate-900/40 border border-slate-800/60 px-3 py-1.5 rounded-lg text-xs font-mono font-medium text-slate-300">
-              <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+            <div className="flex items-center gap-3 bg-white dark:bg-white/[0.04] border border-slate-200/90 dark:border-white/[0.08] px-3 py-1.5 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-200 shadow-2xs">
               <span className="truncate max-w-[150px]">{user.displayName || user.email}</span>
               <button
                 onClick={handleLogout}
-                className="text-slate-400 hover:text-white hover:underline pl-2 border-l border-slate-800/80 transition-colors cursor-pointer focus:outline-none"
+                className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white pl-2.5 border-l border-slate-200 dark:border-white/10 transition-colors cursor-pointer focus-visible:outline-none whitespace-nowrap"
                 id="btn-header-logout"
               >
                 Sign Out
@@ -324,98 +300,89 @@ export default function MainDashboard({
                 setAuthError("");
                 setForgotPasswordSent(false);
               }}
-              className="px-4 py-1.5 rounded-lg text-[13px] font-medium tracking-wide border border-slate-400 bg-transparent text-slate-200 hover:bg-white/10 hover:text-white hover:border-white hover:scale-[1.02] active:scale-[0.98] transition-all cursor-pointer focus:outline-none"
+              className="px-4 py-2 rounded-lg text-xs font-semibold tracking-wide bg-slate-900 dark:bg-white text-white dark:text-slate-950 hover:bg-slate-800 dark:hover:bg-slate-100 active:scale-[0.98] transition-all cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 whitespace-nowrap shrink-0 shadow-xs"
             >
               Get started
             </button>
           )}
         </div>
-      </div>
+      </header>
 
       {/* Central Content Column */}
-      <div className="relative z-10 flex flex-col items-center justify-center my-auto w-full max-w-2xl px-4 text-center" id="dashboard-central">
+      <main className="relative z-10 flex flex-col items-center justify-center my-auto w-full max-w-2xl px-4 py-8 text-center" id="dashboard-central">
         
-        {/* BIG LOGO */}
+        {/* Brand Wordmark */}
         <motion.h1
           id="feynman-logo"
-          initial={{ opacity: 0, y: -20 }}
+          initial={{ opacity: 0, y: -12 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.6, delay: 0.1 }}
-          className="text-6xl md:text-8xl font-black tracking-[0.25em] text-[#faf9ff] pl-[0.25em]"
-          style={{ fontFamily: "'Space Grotesk', system-ui, sans-serif" }}
+          transition={{ duration: 0.45, ease: [0.16, 1, 0.3, 1] }}
+          className="text-5xl sm:text-6xl md:text-[76px] font-extrabold tracking-[0.22em] text-slate-950 dark:text-white pl-[0.22em] select-none"
         >
           FEYNMAN
         </motion.h1>
 
-        {/* Slogan */}
+        {/* Scholarly Serif Tagline */}
         <motion.p
           id="feynman-slogan"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          transition={{ duration: 0.6, delay: 0.3 }}
-          className="text-slate-400 text-lg md:text-xl font-normal italic tracking-wider mt-4"
+          transition={{ duration: 0.45, delay: 0.12 }}
+          className="text-slate-500 dark:text-slate-400 text-lg md:text-2xl font-normal italic tracking-wide mt-3"
+          style={{ fontFamily: "var(--font-serif)" }}
         >
           teach it to learn it
         </motion.p>
 
-        {/* Toggle between Upload and Paste */}
+        {/* Segmented Control between Upload and Paste */}
         <motion.div
           id="dashboard-input-tabs"
-          initial={{ opacity: 0, scale: 0.95 }}
-          animate={{ opacity: 1, scale: 1 }}
-          transition={{ duration: 0.5, delay: 0.35 }}
-          className="flex bg-[#050518] p-1 rounded-full border border-purple-500/15 mt-8 relative z-10 shadow-[0_0_15px_rgba(168,85,247,0.05)]"
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35, delay: 0.18 }}
+          className="inline-flex items-center bg-slate-200/75 dark:bg-white/[0.05] p-1 rounded-xl border border-slate-200/90 dark:border-white/[0.08] mt-8 relative z-10"
         >
           <button
             id="tab-btn-upload"
-            className={`px-5 py-1.5 rounded-full text-xs font-bold tracking-wider transition-all duration-300 cursor-pointer flex items-center space-x-1.5 ${
+            className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all duration-150 cursor-pointer flex items-center gap-2 whitespace-nowrap ${
               activeTab === "upload"
-                ? "bg-[#221035] text-purple-200 border border-purple-500/25 shadow-inner"
-                : "text-slate-400 hover:text-slate-200 border border-transparent"
+                ? "bg-white dark:bg-[#17172b] text-slate-900 dark:text-white shadow-xs"
+                : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
             }`}
             onClick={() => setActiveTab("upload")}
           >
-            <Upload className="w-3.5 h-3.5" />
+            <Upload className="w-3.5 h-3.5 text-violet-600 dark:text-violet-400" />
             <span>Upload File</span>
           </button>
           <button
             id="tab-btn-paste"
-            className={`px-5 py-1.5 rounded-full text-xs font-bold tracking-wider transition-all duration-300 cursor-pointer flex items-center space-x-1.5 ${
+            className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all duration-150 cursor-pointer flex items-center gap-2 whitespace-nowrap ${
               activeTab === "paste"
-                ? "bg-[#221035] text-purple-200 border border-purple-500/25 shadow-inner"
-                : "text-slate-400 hover:text-slate-200 border border-transparent"
+                ? "bg-white dark:bg-[#17172b] text-slate-900 dark:text-white shadow-xs"
+                : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
             }`}
             onClick={() => setActiveTab("paste")}
           >
-            <FileText className="w-3.5 h-3.5" />
+            <FileText className="w-3.5 h-3.5 text-violet-600 dark:text-violet-400" />
             <span>Paste Text / Notes</span>
           </button>
         </motion.div>
 
         {activeTab === "upload" ? (
-          /* Upload Dropzone Widget */
+          /* Clean Single-Elevation Upload Dropzone Card */
           <motion.div
             id="upload-widget"
             key="upload-panel"
-            initial={{ opacity: 0, y: 15 }}
+            initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.4 }}
+            transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
             onClick={triggerFileInput}
-            className={`w-full max-w-lg mt-8 rounded-xl border border-purple-500/20 bg-[#06061c]/60 p-8 md:p-11 transition-all duration-300 relative group cursor-pointer ${
+            className={`w-full max-w-lg mt-6 rounded-2xl border bg-white dark:bg-[#0E0E1D] p-9 md:p-11 transition-all duration-200 relative group cursor-pointer ${
               isDragging 
-                ? "border-purple-400 bg-purple-950/20 scale-[1.01] shadow-[0_0_30px_rgba(168,85,247,0.15)]" 
-                : "hover:border-purple-500/35 hover:bg-purple-950/5 hover:-translate-y-0.5 shadow-[0_0_20px_rgba(0,0,0,0.3)]"
+                ? "border-violet-500 bg-violet-50/70 dark:bg-violet-950/20 scale-[1.01] shadow-lg" 
+                : "border-slate-200/90 dark:border-white/[0.08] hover:border-violet-300 dark:hover:border-violet-500/40 shadow-[0_1px_3px_rgba(15,23,42,0.04),0_12px_32px_rgba(15,23,42,0.04)] dark:shadow-none hover:-translate-y-0.5"
             }`}
           >
-            {/* Corner HUD decorations */}
-            <div className="absolute top-2 left-2 w-3.5 h-3.5 border-t border-l border-purple-400/60 group-hover:border-purple-400" />
-            <div className="absolute top-2 right-2 w-3.5 h-3.5 border-t border-r border-purple-400/60 group-hover:border-purple-400" />
-            <div className="absolute bottom-2 left-2 w-3.5 h-3.5 border-b border-l border-purple-400/60 group-hover:border-purple-400" />
-            <div className="absolute bottom-2 right-2 w-3.5 h-3.5 border-b border-r border-purple-400/60 group-hover:border-purple-400" />
-
-            {/* Dotted border line */}
-            <div className="absolute inset-1.5 border border-dashed border-purple-500/15 rounded-lg pointer-events-none group-hover:border-purple-500/25 transition-colors" />
-
             <input
               type="file"
               id="file-uploader"
@@ -423,66 +390,65 @@ export default function MainDashboard({
               onChange={handleFileChange}
               multiple
               className="hidden"
-              accept=".txt,.md,.mdx,.json,.csv,.png,.jpg,.jpeg,.pdf"
+              accept=".txt,.md,.mdx,.json,.csv,.png,.jpg,.jpeg,.pdf,.ppt,.pptx"
             />
 
-            <div className="flex flex-col items-center justify-center relative z-10 space-y-5" id="upload-widget-content">
-              {/* Upload Button */}
-              <motion.button
-                id="upload-badge-button"
-                whileHover={{ scale: 1.03 }}
-                whileTap={{ scale: 0.98 }}
-                className="py-2 px-5 rounded-lg bg-[#221035] border border-purple-500/30 group-hover:border-purple-400 group-hover:bg-[#2d1449] text-purple-200 group-hover:text-white transition-all text-sm font-medium flex items-center space-x-2 shadow-inner shadow-purple-500/10 cursor-pointer pointer-events-none"
-              >
-                <Upload className="w-4 h-4 text-purple-400 group-hover:text-purple-300" id="icon-inner-upload" />
-                <span>Upload File</span>
-              </motion.button>
+            <div className="flex flex-col items-center justify-center relative z-10 space-y-4" id="upload-widget-content">
+              <div className="w-12 h-12 rounded-2xl bg-violet-50 dark:bg-violet-500/10 border border-violet-200/80 dark:border-violet-500/20 flex items-center justify-center text-violet-600 dark:text-violet-400 group-hover:scale-105 transition-transform">
+                <Upload className="w-5 h-5" id="icon-inner-upload" />
+              </div>
 
-              {/* Hint label */}
-              <p className="text-slate-400 text-[13px] font-medium tracking-wide" id="upload-badge-label">
-                Drop your documents here or click to upload
-              </p>
+              <div className="space-y-1.5">
+                <p className="text-slate-900 dark:text-slate-100 text-sm font-semibold" id="upload-badge-label">
+                  Drop your study material here or browse
+                </p>
+                <p className="text-slate-500 dark:text-slate-400 text-xs">
+                  PDF, PowerPoint (PPT / PPTX), Markdown, Text, CSV, or Lecture Slide Images
+                </p>
+              </div>
+
+              <span
+                id="upload-badge-button"
+                className="mt-1 py-2 px-5 rounded-xl bg-violet-600 group-hover:bg-violet-700 dark:bg-violet-600 dark:group-hover:bg-violet-500 text-white transition-all text-xs font-semibold inline-flex items-center gap-2 shadow-xs pointer-events-none"
+              >
+                <span>Choose File</span>
+              </span>
             </div>
           </motion.div>
         ) : (
-          /* Paste Plain Text Widget */
+          /* Clean Single-Elevation Paste Plain Text Card */
           <motion.div
             id="paste-widget"
             key="paste-panel"
-            initial={{ opacity: 0, y: 15 }}
+            initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.4 }}
-            className="w-full max-w-lg mt-8 rounded-xl border border-purple-500/20 bg-[#06061c]/70 p-6 md:p-8 text-left relative group shadow-[0_0_20px_rgba(0,0,0,0.3)]"
+            transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+            className="w-full max-w-lg mt-6 rounded-2xl border border-slate-200/90 dark:border-white/[0.08] bg-white dark:bg-[#0E0E1D] p-6 md:p-7 text-left relative shadow-[0_1px_3px_rgba(15,23,42,0.04),0_12px_32px_rgba(15,23,42,0.04)] dark:shadow-none"
           >
-            {/* Corner HUD decorations */}
-            <div className="absolute top-2 left-2 w-3.5 h-3.5 border-t border-l border-purple-400/60 group-hover:border-purple-400" />
-            <div className="absolute top-2 right-2 w-3.5 h-3.5 border-t border-r border-purple-400/60 group-hover:border-purple-400" />
-            <div className="absolute bottom-2 left-2 w-3.5 h-3.5 border-b border-l border-purple-400/60 group-hover:border-purple-400" />
-            <div className="absolute bottom-2 right-2 w-3.5 h-3.5 border-b border-r border-purple-400/60 group-hover:border-purple-400" />
-
-            {/* Subtle border line */}
-            <div className="absolute inset-1.5 border border-[#1b1b42]/20 rounded-lg pointer-events-none" />
-
             <div className="space-y-4 relative z-10" id="paste-form-container">
               <div>
-                <label className="block text-[10px] uppercase font-bold tracking-wider text-purple-400 mb-1.5 font-mono">Topic / Title</label>
+                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                  Topic or Title
+                </label>
                 <input
                   type="text"
-                  placeholder="e.g. Photoelectric Effect, Deep Learning Math..."
+                  placeholder="e.g. Support Vector Machines, Photoelectric Effect..."
                   value={pastedTitle}
                   onChange={(e) => setPastedTitle(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-[#030310]/90 border border-[#1b1b42]/70 rounded-lg text-slate-100 text-xs placeholder-slate-600 focus:outline-none focus:border-purple-500/50 transition-all font-semibold"
+                  className="w-full px-3.5 py-2.5 bg-slate-50 dark:bg-[#080814] border border-slate-200 dark:border-white/[0.08] rounded-xl text-slate-900 dark:text-slate-100 text-sm placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-violet-500 dark:focus:border-violet-400 transition-all font-medium"
                   id="paste-title-input"
                 />
               </div>
 
               <div>
-                <label className="block text-[10px] uppercase font-bold tracking-wider text-purple-400 mb-1.5 font-mono">Concept / Text Content</label>
+                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+                  Study Notes or Excerpt
+                </label>
                 <textarea
-                  placeholder="Paste your notes, transcript, chapter summary or explanation text here..."
+                  placeholder="Paste your lecture notes, transcript, or chapter summary here..."
                   value={pastedText}
                   onChange={(e) => setPastedText(e.target.value)}
-                  className="w-full h-32 px-3.5 py-2.5 bg-[#030310]/90 border border-[#1b1b42]/70 rounded-lg text-slate-200 text-xs placeholder-slate-600 focus:outline-none focus:border-purple-500/50 resize-none font-sans leading-relaxed"
+                  className="w-full h-32 px-3.5 py-2.5 bg-slate-50 dark:bg-[#080814] border border-slate-200 dark:border-white/[0.08] rounded-xl text-slate-900 dark:text-slate-100 text-sm placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-violet-500 dark:focus:border-violet-400 resize-none leading-relaxed"
                   id="paste-text-textarea"
                 />
               </div>
@@ -495,41 +461,44 @@ export default function MainDashboard({
                     const finalTitle = pastedTitle.trim() || `Pasted Text (${new Date().toLocaleDateString()})`;
                     onTextPasted(finalTitle, pastedText);
                   }}
-                  className={`px-5 py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all duration-300 flex items-center justify-center cursor-pointer ${
+                  className={`px-5 py-2.5 rounded-xl text-xs font-semibold transition-all duration-150 inline-flex items-center gap-2 cursor-pointer ${
                     pastedText.trim()
-                      ? "bg-[#221035] border border-purple-500/40 text-purple-200 hover:text-white hover:bg-[#2d1449] hover:border-purple-400 active:scale-98 shadow-[0_0_12px_rgba(168,85,247,0.15)]"
-                      : "bg-[#050516] border border-slate-900/60 text-slate-600 cursor-not-allowed"
+                      ? "bg-violet-600 hover:bg-violet-700 text-white shadow-xs active:scale-[0.98]"
+                      : "bg-slate-100 dark:bg-white/[0.05] text-slate-400 dark:text-slate-500 cursor-not-allowed"
                   }`}
                 >
-                  Submit
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Start Studying</span>
                 </button>
               </div>
             </div>
           </motion.div>
         )}
 
-      </div>
+      </main>
 
-      {/* "Get Started" Custom Landing screen modal matching mockup style precisely */}
+      {/* Subtle Bottom Spacer for Visual Balance */}
+      <div className="h-4 shrink-0" />
+
+      {/* Get Started Auth Modal */}
       {showStartModal && (
         <div 
-          className="fixed inset-0 z-50 flex items-center justify-center bg-[#020207]/85 backdrop-blur-md p-4 animate-fadeIn"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 dark:bg-black/75 backdrop-blur-sm p-4"
           onClick={() => setShowStartModal(false)}
           id="get-started-modal"
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 15 }}
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95 }}
-            transition={{ duration: 0.3 }}
-            onClick={(e) => e.stopPropagation()} // Prevent close on card click
-            className="w-full max-w-[370px] rounded-[32px] bg-white p-8 md:p-9 shadow-2xl shadow-black/30 relative text-left"
+            exit={{ opacity: 0, scale: 0.96 }}
+            transition={{ duration: 0.2 }}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-[390px] rounded-2xl bg-white dark:bg-[#111122] border border-slate-200/90 dark:border-white/10 p-7 md:p-8 shadow-2xl relative text-left"
             id="get-started-card"
           >
-            {/* Small subtle close button */}
             <button
               onClick={() => setShowStartModal(false)}
-              className="absolute top-5 right-5 text-slate-400 hover:text-slate-800 transition-colors cursor-pointer text-base p-1 focus:outline-none"
+              className="absolute top-5 right-5 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition-colors cursor-pointer text-base p-1 focus:outline-none"
               title="Close modal"
               id="get-started-close-btn"
             >
@@ -537,39 +506,31 @@ export default function MainDashboard({
             </button>
 
             {authStage === "idle" ? (
-              <div className="py-2">
-                {/* Heading Block */}
-                {isSignUp ? (
-                  <div className="mb-6 select-none">
-                    <h2 className="text-[26px] font-bold tracking-tight text-[#16161a] leading-tight" id="get-started-title">
-                      Welcome to Feynman
-                    </h2>
-                  </div>
-                ) : (
-                  <div className="mb-6 select-none">
-                    <h2 className="text-[26px] font-bold tracking-tight text-[#16161a] leading-tight" id="get-started-title">
-                      Welcome back
-                    </h2>
-                  </div>
-                )}
+              <div className="py-1">
+                <div className="mb-6 select-none">
+                  <h2 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white leading-tight" id="get-started-title">
+                    {isSignUp ? "Create your workspace" : "Welcome back"}
+                  </h2>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                    Sync your uploaded notes and mastery progress across devices.
+                  </p>
+                </div>
 
-                {/* Form fields */}
                 {authError && (
-                  <div className="p-3.5 bg-red-500/10 border border-red-500/20 rounded-[18px] text-red-600 text-xs font-semibold font-sans mb-5 leading-normal break-words" id="auth-error-banner">
+                  <div className="p-3 bg-rose-50 dark:bg-rose-500/10 border border-rose-200 dark:border-rose-500/25 rounded-xl text-rose-700 dark:text-rose-300 text-xs font-medium mb-4 leading-normal break-words" id="auth-error-banner">
                     {authError}
                   </div>
                 )}
 
                 <form 
                   onSubmit={handleAuthSubmit}
-                  className="space-y-4"
+                  className="space-y-3.5"
                   id="get-started-form"
                 >
-                  {/* Full Name field (Sign Up Only) */}
                   {isSignUp && (
                     <div className="relative">
-                      <div className="absolute inset-y-0 left-0 pl-5 flex items-center pointer-events-none">
-                        <User className="h-5 w-5 text-slate-500" strokeWidth={1.8} />
+                      <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                        <User className="h-4 w-4 text-slate-400" />
                       </div>
                       <input
                         required
@@ -577,16 +538,15 @@ export default function MainDashboard({
                         placeholder="Full Name"
                         value={fullName}
                         onChange={(e) => setFullName(e.target.value)}
-                        className="w-full bg-[#f4f4f6] text-[#1a1a1e] placeholder-slate-400 font-medium font-sans text-xs md:text-sm py-4 pl-13 pr-5 rounded-[22px] focus:outline-none focus:ring-2 focus:ring-orange-500/20 transition-all border border-transparent"
+                        className="w-full bg-slate-50 dark:bg-[#090915] text-slate-900 dark:text-white placeholder-slate-400 font-medium text-sm py-3 pl-11 pr-4 rounded-xl focus:outline-none focus:ring-2 focus:ring-violet-500/30 border border-slate-200 dark:border-white/10 transition-all"
                         id="started-fullname-input"
                       />
                     </div>
                   )}
 
-                  {/* Email Input */}
                   <div className="relative">
-                    <div className="absolute inset-y-0 left-0 pl-5 flex items-center pointer-events-none">
-                      <Mail className="h-5 w-5 text-slate-500" strokeWidth={1.8} />
+                    <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                      <Mail className="h-4 w-4 text-slate-400" />
                     </div>
                     <input
                       required
@@ -594,15 +554,14 @@ export default function MainDashboard({
                       placeholder="Email"
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
-                      className="w-full bg-[#f4f4f6] text-[#1a1a1e] placeholder-slate-400 font-medium font-sans text-xs md:text-sm py-4 pl-13 pr-5 rounded-[22px] focus:outline-none focus:ring-2 focus:ring-orange-500/20 transition-all border border-transparent"
+                      className="w-full bg-slate-50 dark:bg-[#090915] text-slate-900 dark:text-white placeholder-slate-400 font-medium text-sm py-3 pl-11 pr-4 rounded-xl focus:outline-none focus:ring-2 focus:ring-violet-500/30 border border-slate-200 dark:border-white/10 transition-all"
                       id="started-email-input"
                     />
                   </div>
 
-                  {/* Password Input */}
                   <div className="relative">
-                    <div className="absolute inset-y-0 left-0 pl-5 flex items-center pointer-events-none">
-                      <Lock className="h-5 w-5 text-slate-500" strokeWidth={1.8} />
+                    <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                      <Lock className="h-4 w-4 text-slate-400" />
                     </div>
                     <input
                       required
@@ -610,16 +569,15 @@ export default function MainDashboard({
                       placeholder="Password"
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
-                      className="w-full bg-[#f4f4f6] text-[#1a1a1e] placeholder-slate-400 font-medium font-sans text-xs md:text-sm py-4 pl-13 pr-5 rounded-[22px] focus:outline-none focus:ring-2 focus:ring-orange-500/20 transition-all border border-transparent"
+                      className="w-full bg-slate-50 dark:bg-[#090915] text-slate-900 dark:text-white placeholder-slate-400 font-medium text-sm py-3 pl-11 pr-4 rounded-xl focus:outline-none focus:ring-2 focus:ring-violet-500/30 border border-slate-200 dark:border-white/10 transition-all"
                       id="started-password-input"
                     />
                   </div>
 
-                  {/* Confirm Password Input (Sign Up Only) */}
                   {isSignUp && (
                     <div className="relative">
-                      <div className="absolute inset-y-0 left-0 pl-5 flex items-center pointer-events-none">
-                        <Lock className="h-5 w-5 text-slate-500" strokeWidth={1.8} />
+                      <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                        <Lock className="h-4 w-4 text-slate-400" />
                       </div>
                       <input
                         required
@@ -627,24 +585,23 @@ export default function MainDashboard({
                         placeholder="Confirm Password"
                         value={confirmPassword}
                         onChange={(e) => setConfirmPassword(e.target.value)}
-                        className="w-full bg-[#f4f4f6] text-[#1a1a1e] placeholder-slate-400 font-medium font-sans text-xs md:text-sm py-4 pl-13 pr-5 rounded-[22px] focus:outline-none focus:ring-2 focus:ring-orange-500/20 transition-all border border-transparent"
+                        className="w-full bg-slate-50 dark:bg-[#090915] text-slate-900 dark:text-white placeholder-slate-400 font-medium text-sm py-3 pl-11 pr-4 rounded-xl focus:outline-none focus:ring-2 focus:ring-violet-500/30 border border-slate-200 dark:border-white/10 transition-all"
                         id="started-confirmpassword-input"
                       />
                     </div>
                   )}
 
-                  {/* Forgot Password Link (Login Only) */}
                   {!isSignUp && (
                     <div className="flex items-center justify-between px-1">
                       {forgotPasswordSent ? (
-                        <span className="text-[11px] font-sans text-green-600 font-medium">✓ Reset email sent successfully</span>
+                        <span className="text-xs text-emerald-600 dark:text-emerald-400 font-medium">Reset email sent</span>
                       ) : (
                         <div />
                       )}
                       <button
                         type="button"
                         onClick={handleForgotPassword}
-                        className="text-[12px] text-[#ea580c] hover:text-[#d94e06] font-medium font-sans cursor-pointer focus:outline-none hover:underline"
+                        className="text-xs text-violet-600 dark:text-violet-400 hover:underline font-medium cursor-pointer focus:outline-none"
                         id="btn-forgot-password"
                       >
                         Forgot Password?
@@ -652,31 +609,28 @@ export default function MainDashboard({
                     </div>
                   )}
 
-                  {/* Action form Button in Coral/Orange color with rounded border */}
                   <button
                     type="submit"
-                    className="w-full bg-[#ea580c] hover:bg-[#d94e06] active:scale-[0.98] transition-all text-white font-semibold font-sans py-4 rounded-[22px] shadow-md shadow-orange-600/10 cursor-pointer focus:outline-none text-[15px] mt-2 block text-center"
+                    className="w-full bg-violet-600 hover:bg-violet-700 active:scale-[0.99] transition-all text-white font-semibold py-3 rounded-xl shadow-sm cursor-pointer focus:outline-none text-sm mt-2 block text-center"
                     id="get-started-primary-btn"
                   >
                     {isSignUp ? "Create Account" : "Continue Learning"}
                   </button>
                 </form>
 
-                {/* Styled ────────────── divider */}
                 <div className="relative flex py-4 items-center select-none" id="auth-divider">
-                  <div className="flex-grow border-t border-slate-200"></div>
-                  <span className="flex-shrink mx-4 text-slate-300 font-sans text-[11px]">──────────────</span>
-                  <div className="flex-grow border-t border-slate-200"></div>
+                  <div className="flex-grow border-t border-slate-200 dark:border-white/10"></div>
+                  <span className="flex-shrink mx-3 text-slate-400 text-xs">or</span>
+                  <div className="flex-grow border-t border-slate-200 dark:border-white/10"></div>
                 </div>
 
-                {/* Google Sign in Button */}
                 <button
                   type="button"
                   onClick={handleGoogleAuth}
-                  className="w-full bg-white border border-slate-200/80 hover:bg-slate-50 active:scale-[0.98] transition-all text-[#374151] font-semibold font-sans py-3.5 rounded-[22px] cursor-pointer focus:outline-none text-[14px] flex items-center justify-center"
+                  className="w-full bg-white dark:bg-[#19192e] border border-slate-200 dark:border-white/10 hover:bg-slate-50 dark:hover:bg-[#20203a] active:scale-[0.99] transition-all text-slate-700 dark:text-slate-100 font-semibold py-3 rounded-xl cursor-pointer focus:outline-none text-sm flex items-center justify-center"
                   id="get-started-google-btn"
                 >
-                  <svg className="w-4.5 h-4.5 mr-2.5" viewBox="0 0 24 24">
+                  <svg className="w-4 h-4 mr-2.5" viewBox="0 0 24 24">
                     <path
                       fill="#4285F4"
                       d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
@@ -697,20 +651,19 @@ export default function MainDashboard({
                   Continue with Google
                 </button>
 
-                {/* Direct helper redirection toggler link matching mockup "Already Have An Account? Login" */}
-                <div className="text-center mt-6">
+                <div className="text-center mt-5">
                   <button
                     onClick={() => setIsSignUp(!isSignUp)}
-                    className="text-[12px] text-slate-500 hover:text-slate-800 transition-colors font-medium font-sans cursor-pointer focus:outline-none"
+                    className="text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-colors font-medium cursor-pointer focus:outline-none"
                     id="get-started-toggle-btn"
                   >
                     {isSignUp ? (
                       <>
-                        Already Have An Account? <span className="text-[#ea580c] hover:text-[#d94e06] font-bold">Login</span>
+                        Already have an account? <span className="text-violet-600 dark:text-violet-400 font-semibold">Login</span>
                       </>
                     ) : (
                       <>
-                        Don't Have An Account? <span className="text-[#ea580c] hover:text-[#d94e06] font-bold">Sign Up</span>
+                        Don&apos;t have an account? <span className="text-violet-600 dark:text-violet-400 font-semibold">Sign Up</span>
                       </>
                     )}
                   </button>
@@ -718,23 +671,23 @@ export default function MainDashboard({
               </div>
             ) : authStage === "loading" ? (
               <div className="py-12 flex flex-col items-center justify-center space-y-4">
-                <div className="w-8 h-8 border-2 border-orange-500 border-t-transparent rounded-full animate-spin" />
-                <p className="text-xs text-slate-500 font-sans font-medium tracking-wide">Establishing secure {authType === "Google Sync" ? "Google key" : authType} session...</p>
+                <div className="w-8 h-8 border-2 border-violet-600 dark:border-violet-400 border-t-transparent rounded-full animate-spin" />
+                <p className="text-xs text-slate-500 dark:text-slate-400 font-medium">
+                  Establishing secure {authType === "Google Sync" ? "Google" : authType} session...
+                </p>
               </div>
             ) : (
-              <div className="py-12 flex flex-col items-center justify-center space-y-3 font-sans">
-                <div className="w-10 h-10 rounded-full border border-green-500/30 bg-green-500/5 flex items-center justify-center text-green-600">
+              <div className="py-12 flex flex-col items-center justify-center space-y-3">
+                <div className="w-10 h-10 rounded-full border border-emerald-500/30 bg-emerald-50 dark:bg-emerald-500/10 flex items-center justify-center text-emerald-600 dark:text-emerald-400 font-bold">
                   ✓
                 </div>
-                <p className="text-sm text-slate-800 font-semibold tracking-wide">Welcome to Feynman Arena!</p>
-                <p className="text-[10px] text-slate-400 uppercase tracking-widest font-mono">Secure Link Established</p>
+                <p className="text-sm text-slate-900 dark:text-white font-semibold">Welcome to Feynman</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">Session ready</p>
               </div>
             )}
           </motion.div>
         </div>
       )}
-
-      {/* Footer removed */}
     </div>
   );
 }

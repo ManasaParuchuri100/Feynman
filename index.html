@@ -7,6 +7,23 @@
     <meta name="description" content="An interactive Feynman Technique companion that helps you teach to learn. Upload files, extract concepts, explore contextual sources, and explain them back to Feynman to master your understanding." />
     <meta property="og:title" content="Feynman - Active Learning & Study Sources Platform" />
     <meta property="og:description" content="An interactive Feynman Technique companion that helps you teach to learn. Upload files, extract concepts, explore contextual sources, and explain them back to Feynman to master your understanding." />
+    <script>
+      (function() {
+        try {
+          var t = localStorage.getItem('feynman_theme');
+          var isDark = t ? t === 'dark' : true;
+          if (isDark) {
+            document.documentElement.classList.add('dark');
+            document.documentElement.style.colorScheme = 'dark';
+          } else {
+            document.documentElement.classList.remove('dark');
+            document.documentElement.style.colorScheme = 'light';
+          }
+        } catch (e) {
+          document.documentElement.classList.add('dark');
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

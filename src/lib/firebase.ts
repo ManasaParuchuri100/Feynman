@@ -216,9 +216,16 @@ export async function saveUploadedFileToFirestore(
   uid: string,
   fileId: string,
   fileName: string,
-  fileUrl: string, // stores file contents / file payload
+  fileUrl: string, // stores file contents / compact file reference URL
   knowledgeMapOrExtractedTopics: any = "",
-  extractedTopicsParam: any[] = []
+  extractedTopicsParam: any[] = [],
+  ragMeta?: {
+    contentHash?: string;
+    ragStatus?: string;
+    pageCount?: number;
+    chunkCount?: number;
+    documentOverview?: string;
+  }
 ): Promise<void> {
   try {
     let extractedTopics = extractedTopicsParam;
@@ -232,17 +239,37 @@ export async function saveUploadedFileToFirestore(
       }
     }
 
-    const fileType = fileName.toLowerCase().endsWith(".pdf") ? "application/pdf" : "text/plain";
+    const lowerFileName = fileName.toLowerCase();
+    const fileType = lowerFileName.endsWith(".pdf")
+      ? "application/pdf"
+      : lowerFileName.endsWith(".pptx")
+      ? "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+      : lowerFileName.endsWith(".ppt")
+      ? "application/vnd.ms-powerpoint"
+      : "text/plain";
     const fileRef = doc(db, "users", uid, "uploads", fileId);
-    
-    await setDoc(fileRef, {
+    // Guard against Firestore's 1MB document size limit for large PDFs
+    const safeFileUrl =
+      fileUrl && fileUrl.length > 750_000
+        ? `/api/rag/document/${encodeURIComponent(fileId)}/file`
+        : fileUrl;
+
+    const payload: Record<string, any> = {
       fileName,
       fileType,
-      fileUrl,
+      fileUrl: safeFileUrl,
       uploadedAt: new Date().toISOString(),
       extractedTopicsCount: extractedTopics ? extractedTopics.length : 0,
       knowledgeMap: typeof knowledgeMapOrExtractedTopics === "string" ? knowledgeMapOrExtractedTopics : JSON.stringify(extractedTopics)
-    }, { merge: true });
+    };
+
+    if (ragMeta?.contentHash) payload.contentHash = ragMeta.contentHash;
+    if (ragMeta?.ragStatus) payload.ragStatus = ragMeta.ragStatus;
+    if (typeof ragMeta?.pageCount === "number") payload.pageCount = ragMeta.pageCount;
+    if (typeof ragMeta?.chunkCount === "number") payload.chunkCount = ragMeta.chunkCount;
+    if (ragMeta?.documentOverview) payload.documentOverview = ragMeta.documentOverview;
+
+    await setDoc(fileRef, payload, { merge: true });
   } catch (error) {
     console.error("Error saving uploaded file:", error);
   }
@@ -272,9 +299,22 @@ export async function getUploadedFilesFromFirestore(uid: string): Promise<Upload
         name: data.fileName || "Unnamed file",
         content: data.fileUrl || "",
         size: data.fileUrl ? data.fileUrl.length : 0,
-        type: data.fileType || (data.fileName?.toLowerCase()?.endsWith(".pdf") ? "application/pdf" : "text/plain"),
+        type:
+          data.fileType ||
+          (data.fileName?.toLowerCase()?.endsWith(".pdf")
+            ? "application/pdf"
+            : data.fileName?.toLowerCase()?.endsWith(".pptx")
+            ? "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            : data.fileName?.toLowerCase()?.endsWith(".ppt")
+            ? "application/vnd.ms-powerpoint"
+            : "text/plain"),
         uploadedAt: data.uploadedAt || new Date().toISOString(),
-        knowledgeMap: data.knowledgeMap || ""
+        knowledgeMap: data.knowledgeMap || "",
+        contentHash: data.contentHash,
+        ragStage: data.ragStatus as UploadedFile["ragStage"],
+        pageCount: data.pageCount,
+        chunkCount: data.chunkCount,
+        documentOverview: data.documentOverview,
       });
     });
     return filesList;

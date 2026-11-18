@@ -1,312 +1,499 @@
 import express from "express";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
 import dotenv from "dotenv";
+import multer from "multer";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
+import { AuthError, resolveRequestUser } from "./server/rag/auth.ts";
+import {
+  curateSourcesWithRag,
+  evaluateFeynmanWithRag,
+  generateFlashcardsWithRag,
+} from "./server/rag/geminiService.ts";
+import {
+  awaitActiveIngestionIfPresent,
+  startDocumentIngestion,
+} from "./server/rag/pipeline.ts";
+import { retrieveRelevantChunks } from "./server/rag/retriever.ts";
+import {
+  deleteDocumentForUser,
+  getDocumentRecord,
+  getParentChunks,
+} from "./server/rag/vectorStore.ts";
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
 
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
+app.use(express.json({ limit: "60mb" }));
+app.use(express.urlencoded({ limit: "60mb", extended: true }));
 
-// Initialize Gemini SDK with telemetry header
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      "User-Agent": "aistudio-build",
-    },
-  },
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 80 * 1024 * 1024 },
 });
 
-// Helper to call Gemini API with automatic model fallback of free tier models to avoid 429 Rate Limits and 503 High Demand Errors
-async function generateContentWithFallback(params: any): Promise<any> {
-  try {
-    return await ai.models.generateContent(params);
-  } catch (error: any) {
-    const errorMsg = error.message || (typeof error === 'object' ? JSON.stringify(error) : String(error));
-    console.warn(`Primary model '${params.model}' call failed. Error: ${errorMsg}`);
-    
-    if (params.model === "gemini-3.5-flash") {
-      console.warn("Gracefully falling back to stable free-tier model 'gemini-3.1-flash-lite'...");
-      const fallbackParams = {
-        ...params,
-        model: "gemini-3.1-flash-lite"
-      };
-      try {
-        return await ai.models.generateContent(fallbackParams);
-      } catch (fallbackError: any) {
-        console.error("Fallback model 'gemini-3.1-flash-lite' also failed:", fallbackError.message || fallbackError);
-        throw fallbackError;
-      }
-    }
-    throw error;
+function handleRouteError(res: express.Response, error: any, fallbackMsg: string) {
+  if (error instanceof AuthError) {
+    return res.status(error.statusCode).json({ error: error.message });
   }
+  console.error(fallbackMsg, error);
+  return res.status(500).json({ error: error?.message || fallbackMsg });
 }
 
-// API Routes
-app.get("/api/health", (req, res) => {
+// Health check
+app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
 
-// 1. Concept Extraction API
-app.post("/api/document/concepts", async (req, res) => {
+// 1. Asynchronous Document Ingestion (supports multipart binary upload or JSON payload)
+app.post("/api/rag/ingest", upload.single("file"), async (req, res) => {
   try {
-    const { fileName, fileType, fileContent } = req.body;
+    const { userId } = await resolveRequestUser(req);
 
-    if (!fileContent) {
-      return res.status(400).json({ error: "Missing file content" });
+    const fileId = String(req.body?.fileId || req.body?.documentId || "").trim();
+    const fileName = String(
+      req.body?.fileName || req.file?.originalname || "Uploaded Document"
+    ).trim();
+    const fileType = String(
+      req.body?.fileType || req.file?.mimetype || "text/plain"
+    ).trim();
+    const fileSize = Number(req.body?.fileSize || req.file?.size || 0);
+    const waitForReady = req.body?.wait === true || req.body?.wait === "true" || req.query.wait === "true";
+
+    if (!fileId) {
+      return res.status(400).json({ error: "Missing documentId / fileId" });
     }
 
-    let contents: any[] = [];
-    let promptText = `
-      You are an expert tutor specializing in the Feynman Technique ("teach it to learn it").
-      You have been given a document named "${fileName}" of type "${fileType}".
-      
-      CRITICAL RULE: Rely ONLY on the information explicitly contained in the provided document. Do NOT introduce or assume external knowledge, facts, definitions, or secondary context not stated in the document. All extracted topics and summaries must be 100% grounded in and traceable to the provided content. If the document content is extremely short or simple, extract only the topics that can be rigorously justified from the text, even if that results in fewer than 4 topics (e.g., 1 to 3 topics). Do not add any extra, fabricated, or external details.
+    const rawBytes = req.file ? new Uint8Array(req.file.buffer) : undefined;
+    const textOrDataUrl =
+      typeof req.body?.fileContent === "string" ? req.body.fileContent : undefined;
 
-      Your task is to analyze this content and extract 4 to 6 core scientific, academic, or professional concepts (or fewer, if the text is short) that a student can study and explain back to you.
-      For each concept, provide:
-      1. A clear, concise 'title' direct from the text.
-      2. The 'difficulty' (one of: 'Easy', 'Medium', 'Hard').
-      3. A high-level 'summary' of what the concept means, based strictly on the provided content.
-      4. A welcoming and specific 'suggestedExplanationPrompt' asking the student to teach you this, formulated strictly from the facts in the document.
-    `;
-
-    const isBinaryOrImage = fileType.startsWith("image/") || fileType === "application/pdf" || fileContent.startsWith("data:application/pdf");
-
-    if (isBinaryOrImage) {
-      // It's an image or PDF input passed as base64
-      const base64Data = fileContent.split(",")[1] || fileContent;
-      const mime = fileContent.startsWith("data:") 
-        ? (fileContent.substring(5, fileContent.indexOf(";")) || fileType)
-        : fileType;
-
-      contents = [
-        {
-          inlineData: {
-            mimeType: mime,
-            data: base64Data,
-          },
-        },
-        { text: promptText },
-      ];
-    } else {
-      // It's text/markdown/csv or plain string
-      contents = [
-        {
-          text: `Here is the content of the document:\n\n${fileContent}\n\n${promptText}`,
-        },
-      ];
+    if (!rawBytes && !textOrDataUrl) {
+      return res.status(400).json({ error: "Missing file content or uploaded file binary" });
     }
 
-    const response = await generateContentWithFallback({
-      model: "gemini-3.5-flash",
-      contents: { parts: contents },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            concepts: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  title: { type: Type.STRING },
-                  difficulty: { type: Type.STRING, description: "Easy, Medium, or Hard" },
-                  summary: { type: Type.STRING },
-                  suggestedExplanationPrompt: { type: Type.STRING },
-                },
-                required: ["title", "difficulty", "summary", "suggestedExplanationPrompt"],
-              },
-            },
-          },
-          required: ["concepts"],
-        },
-      },
+    const { record, promise } = startDocumentIngestion({
+      userId,
+      documentId: fileId,
+      fileName,
+      fileType,
+      fileSize,
+      rawBytes,
+      textOrDataUrl,
     });
 
-    const textOutput = response.text;
-    if (!textOutput) {
-      throw new Error("No response text from Gemini");
+    if (waitForReady || record.stage === "ready") {
+      const completed = await promise;
+      return res.status(completed.stage === "error" ? 500 : 200).json({
+        ...completed,
+        fileUrl: `/api/rag/document/${encodeURIComponent(fileId)}/file`,
+      });
     }
 
-    const result = JSON.parse(textOutput.trim());
-    res.json(result);
-  } catch (error: any) {
-    console.error("Error in extracting concepts:", error);
-    res.status(500).json({ error: error.message || "Failed to extract concepts" });
+    return res.status(202).json({
+      ...record,
+      fileUrl: `/api/rag/document/${encodeURIComponent(fileId)}/file`,
+    });
+  } catch (error) {
+    return handleRouteError(res, error, "Failed to start document ingestion");
   }
 });
 
-// 2. Feynman Evaluation and Response API
+// 2. Poll Document Ingestion Status & Cached Structure (user-isolated)
+app.get("/api/rag/status/:documentId", async (req, res) => {
+  try {
+    const { userId } = await resolveRequestUser(req);
+    const documentId = String(req.params.documentId || "").trim();
+    const record = getDocumentRecord(userId, documentId);
+    if (!record) {
+      return res.status(404).json({ error: "Document not found for this user" });
+    }
+    return res.json(record);
+  } catch (error) {
+    return handleRouteError(res, error, "Failed to read document ingestion status");
+  }
+});
+
+// 3. Stream Stored Document Binary for PDF Preview (strictly user-isolated)
+app.get("/api/rag/document/:documentId/file", async (req, res) => {
+  try {
+    const { userId } = await resolveRequestUser(req);
+    const documentId = String(req.params.documentId || "").trim();
+    const record = getDocumentRecord(userId, documentId);
+    if (!record || !record.storedFilePath || !fs.existsSync(record.storedFilePath)) {
+      return res.status(404).json({ error: "Stored document file not found" });
+    }
+
+    const lowerName = record.fileName.toLowerCase();
+    const resolvedType =
+      record.fileType && record.fileType !== "application/octet-stream"
+        ? record.fileType
+        : lowerName.endsWith(".pptx")
+        ? "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        : lowerName.endsWith(".ppt")
+        ? "application/vnd.ms-powerpoint"
+        : lowerName.endsWith(".pdf")
+        ? "application/pdf"
+        : "application/octet-stream";
+
+    res.setHeader("Content-Type", resolvedType);
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${record.fileName.replace(/"/g, "")}"`
+    );
+    return fs.createReadStream(record.storedFilePath).pipe(res);
+  } catch (error) {
+    return handleRouteError(res, error, "Failed to stream stored document");
+  }
+});
+
+// 3b. Extracted Sections / Slides Preview (for PPT/PPTX and server-stored files)
+app.get("/api/rag/document/:documentId/preview", async (req, res) => {
+  try {
+    const { userId } = await resolveRequestUser(req);
+    const documentId = String(req.params.documentId || "").trim();
+    const record = getDocumentRecord(userId, documentId);
+    if (!record) {
+      return res.status(404).json({ error: "Document not found for this user" });
+    }
+
+    const parents = getParentChunks(userId, documentId);
+    return res.json({
+      fileName: record.fileName,
+      fileType: record.fileType,
+      pageCount: record.pageCount,
+      stage: record.stage,
+      overview: record.structure?.overview,
+      sections: parents.map((p) => ({
+        id: p.id,
+        title: p.sectionTitle,
+        pageStart: p.pageStart,
+        pageEnd: p.pageEnd,
+        text: p.text,
+      })),
+    });
+  } catch (error) {
+    return handleRouteError(res, error, "Failed to load document preview");
+  }
+});
+
+// 4. Delete Document Vectors & Metadata (strictly user-isolated)
+app.delete("/api/rag/document/:documentId", async (req, res) => {
+  try {
+    const { userId } = await resolveRequestUser(req);
+    const documentId = String(req.params.documentId || "").trim();
+    const deleted = deleteDocumentForUser(userId, documentId);
+    return res.json({ deleted });
+  } catch (error) {
+    return handleRouteError(res, error, "Failed to delete document index");
+  }
+});
+
+// 5. Direct Vector + Hybrid Retrieval Endpoint (user- and document-isolated)
+app.post("/api/rag/retrieve", async (req, res) => {
+  try {
+    const { userId } = await resolveRequestUser(req);
+    const { documentId, query, topK, includeAdjacent } = req.body || {};
+    if (!documentId || !query) {
+      return res.status(400).json({ error: "Missing documentId or query" });
+    }
+    const record = getDocumentRecord(userId, String(documentId));
+    if (!record) {
+      return res.status(404).json({ error: "Document not found" });
+    }
+    const result = await retrieveRelevantChunks({
+      userId,
+      documentId: String(documentId),
+      query: String(query),
+      topK: typeof topK === "number" ? topK : 5,
+      includeAdjacent: includeAdjacent !== false,
+    });
+    return res.json({
+      citations: result.citations,
+      latencyMs: result.latencyMs,
+      chunkCount: result.chunks.length,
+      formattedContext: result.formattedContext,
+    });
+  } catch (error) {
+    return handleRouteError(res, error, "Failed to retrieve relevant chunks");
+  }
+});
+
+// 6. Concept Extraction & Document Structure API (uses cached RAG structure)
+app.post("/api/document/concepts", async (req, res) => {
+  try {
+    const { userId } = await resolveRequestUser(req);
+    const { fileId, fileName, fileType, fileContent } = req.body || {};
+    const documentId = String(fileId || "").trim();
+
+    let record = documentId ? await awaitActiveIngestionIfPresent(userId, documentId) : null;
+
+    if ((!record || record.stage === "error") && fileContent) {
+      const effectiveId = documentId || `doc_${Date.now()}`;
+      const { promise } = startDocumentIngestion({
+        userId,
+        documentId: effectiveId,
+        fileName: String(fileName || "Document"),
+        fileType: String(fileType || "text/plain"),
+        fileSize: typeof fileContent === "string" ? fileContent.length : 0,
+        textOrDataUrl: String(fileContent),
+      });
+      record = await promise;
+    }
+
+    if (!record) {
+      return res.status(400).json({ error: "Missing file content or unindexed document ID" });
+    }
+    if (record.stage === "error") {
+      return res.status(500).json({ error: record.error || "Document indexing failed" });
+    }
+    if (!record.structure) {
+      return res.status(500).json({ error: "Document structure not available" });
+    }
+
+    return res.json({
+      concepts: record.structure.concepts,
+      overview: record.structure.overview,
+      chapters: record.structure.chapters,
+      keyDefinitions: record.structure.keyDefinitions,
+      pageCount: record.pageCount,
+      chunkCount: record.chunkCount,
+      contentHash: record.contentHash,
+      ragStatus: record.stage,
+    });
+  } catch (error) {
+    return handleRouteError(res, error, "Failed to extract concepts");
+  }
+});
+
+// 7. Feynman Evaluation API (retrieves ONLY relevant chunks + adjacent context)
 app.post("/api/feynman/evaluate", async (req, res) => {
   try {
-    const { conceptTitle, conceptSummary, userExplanation, previousChat, originalContent, fileType, userDrawings } = req.body;
+    const { userId } = await resolveRequestUser(req);
+    const {
+      fileId,
+      fileName,
+      conceptTitle,
+      conceptSummary,
+      userExplanation,
+      previousChat,
+      originalContent,
+      fileType,
+      userDrawings,
+      topK,
+    } = req.body || {};
 
     if (!conceptTitle || !userExplanation) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    const chatContext = previousChat && previousChat.length > 0
-      ? previousChat.map((m: any) => `${m.role === "user" ? "Student" : "Tutor"}: ${m.text}`).join("\n")
-      : "No previous discussion.";
+    const documentId = String(fileId || "").trim();
+    let record = documentId ? await awaitActiveIngestionIfPresent(userId, documentId) : null;
 
-    const promptText = `
-      You are Feynman, an intelligent and extremely curious student learning about "${conceptTitle}".
-      Your goal is to apply the Feynman Technique ("teach it to learn it") to help the teacher (the human user) master this concept by explaining it simply.
-      
-      CRITICAL RULE: Evaluate and respond based ONLY on the provided original source document/material and the concept definitions. Do NOT bring in any outside knowledge, secondary context, or details not present in the original document. Any follow-up questions or observations must be strictly traceable to facts explicitly present in the provided content. Do not fabricate facts.
-
-      Concept context/definition: "${conceptSummary}"
-      Current concept being taught: "${conceptTitle}"
-      
-      Conversation history:
-      ${chatContext}
-      
-      User's Explanation/Teaching (including text and voice):
-      "${userExplanation}"
-      
-      Your task:
-      1. Compare the user's explanation directly with the provided original source document/material and the concept definitions.
-      2. Carefully assess the explanation. Be supportive, constructive, and highly conversational.
-      
-      CRITICAL EVALUATION RUBRIC & DETERMINISTIC SCORING RULES:
-      Evaluate active user understanding shown in their text, voice transcripts, and board sketch data. You must rate the explanation from 0 to 100 on these four criteria:
-         - 'clarity': Is it easy to follow and coherent?
-         - 'accuracy': Is it scientifically and factually correct based on the original source document and diagrams?
-         - 'simplicity': Does it avoid complex technical jargon or translate it into metaphors that a 10-year-old child can understand?
-         - 'completeness': Does it cover all details, key terms, or nuances present in the original source material regarding "${conceptTitle}"?
-
-      CRITICAL SCORE SCALE:
-         - EXTREMELY LOW UNDERSTANDING (Score: 0 to 20): The user's input/explanation is empty, extremely short (under 15 words), contains only noise/greetings (e.g., "hi", "hello", "skip", "test"), or says they don't know (e.g. "I don't know", "can you teach me"). Assign a score of 0 to 20 across all four metrics. NEVER give a grade above 25 if there is no actual explanation attempt.
-         - WEAK/SUPERFICIAL UNDERSTANDING (Score: 21 to 55): User makes an attempt but provides mostly incorrect information, repeats terms without explaining them, or has severe misconceptions compared to the source material.
-         - MODERATE/PARTIAL UNDERSTANDING (Score: 56 to 79): User explains parts of the concept correctly but leaves out key definitions, mechanisms, or relationships. Or they explain it correctly but rely purely on copying direct dense jargon without simplifying it (capping simplicity < 60).
-         - STRONG/COMPLETE UNDERSTANDING (Score: 80 to 100): User teaches the concept completely, accurately, and explains it in a highly simplified and crystal-clear way. High scores (e.g. 80-100) are reserved for genuine evidence of deep understanding.
-
-      3. Support pictures and drawings:
-         - Analyze hand-drawn whiteboard sketches or diagram segments (supplied as base64 images).
-         - Grade these drawings solely on their CONCEPTUAL UNDERSTANDING and logical core ideas (e.g., direction of flow, connections), NOT on pixel-to-pixel matches, artistic skill, or visual perfection.
-      4. Identify 'gaps': Specific missing points, factually incorrect statements, or unexplained jargon, directly referenced and compared against the uploaded original source. Mention specifically what was present in the original source document but was missing or forgotten from their explanation of "${conceptTitle}".
-      5. Write 'feedbackText' as Feynman the student. Keep it in character: curious, friendly, and asking a gentle but sharp follow-up question.
-         
-         CRITICAL REQUIREMENT: The follow-up question in 'feedbackText' MUST be explicitly and dynamically formulated based on BOTH the specific sub-topic/concept "${conceptTitle}" being discussed AND the user's determined grading scores you just calculated:
-         - If 'accuracy' is lower (< 80): Ask a clarification question targeting a factually weak, incorrect, or suspect statement in their explanation or drawing relative to the original source.
-         - If 'completeness' is lower (< 80): Pose a question about a major section, formula, or detail from the original document that the user omitted or forgot to explain.
-         - If 'simplicity' is lower (< 80): Ask them if they can build or share a simple, playful metaphor or everyday analogy to demystify the complex technical jargon they used.
-         - If 'clarity' is lower (< 80): Ask them if they can break down their explanation stage-by-stage or clarify the logical connection between two of their points.
-         - If all scores are high (>= 80): Celebrate their teaching mastery, and ask a creative "what-if" or advanced scenario-based question also directly grounded in the original source material to stimulate further thinking.
-
-         The question must feel like a natural student question, and must directly reference and acknowledge any custom hand-drawn whiteboard sketches, diagram segments, or specific terminology they taught.
-      6. Provide dry 'suggestions' for how they can simplify or expand their explanation or whiteboard drawing next time to fill the gaps.
-    `;
-
-    let contents: any[] = [];
-
-    const isImage = !!(fileType && (
-      fileType.startsWith("image/") || 
-      (typeof originalContent === "string" && originalContent.startsWith("data:image/"))
-    ));
-
-    if (isImage && typeof originalContent === "string" && originalContent) {
-      const base64Data = originalContent.split(",")[1] || originalContent;
-      const mime = originalContent.startsWith("data:") 
-        ? (originalContent.substring(5, originalContent.indexOf(";")) || fileType)
-        : fileType;
-
-      contents.push({
-        inlineData: {
-          mimeType: mime,
-          data: base64Data,
-        },
+    // Lazy-index legacy documents that predate the RAG upgrade
+    if ((!record || record.stage === "error") && originalContent && documentId) {
+      const { promise } = startDocumentIngestion({
+        userId,
+        documentId,
+        fileName: String(fileName || "Study Document"),
+        fileType: String(fileType || "text/plain"),
+        fileSize: typeof originalContent === "string" ? originalContent.length : 0,
+        textOrDataUrl: String(originalContent),
       });
-    } else if (originalContent && !originalContent.startsWith("data:application/pdf") && fileType !== "application/pdf") {
-      // Truncate original content slightly if extremely long to improve api response time and prevent token overhead
-      const maxCharCount = 15000;
-      const truncatedDoc = originalContent.length > maxCharCount
-        ? originalContent.substring(0, maxCharCount) + "\n[Content truncated for system evaluation performance]"
-        : originalContent;
-      const docContext = `Here is the complete original source document context:\n\n${truncatedDoc}\n\n`;
-      contents.push({ text: docContext });
-    } else {
-      // For large PDFs, we pass the extracted concept and summary as the primary reference text to avoid sending megabytes of base64 data on every run
-      const docContext = `Here is the extracted reference context for this topic:\nConcept: ${conceptTitle}\nSummary & Key Details: ${conceptSummary}\n`;
-      contents.push({ text: docContext });
+      record = await promise;
     }
 
-    // Append hand-drawn whiteboard drawing segments as inlineData image objects for Gemini to inspect
-    if (userDrawings && Array.isArray(userDrawings) && userDrawings.length > 0) {
-      userDrawings.forEach((dataUrl: string) => {
-        if (!dataUrl) return;
-        const base64Data = dataUrl.split(",")[1] || dataUrl;
-        const mime = dataUrl.startsWith("data:") 
-          ? (dataUrl.substring(5, dataUrl.indexOf(";")) || "image/png")
-          : "image/png";
-        contents.push({
-          inlineData: {
-            mimeType: mime,
-            data: base64Data,
-          }
-        });
+    let retrievedContext = "";
+    let citations: any[] = [];
+    let retrievalLatencyMs = 0;
+
+    if (record && record.stage === "ready") {
+      const retrievalQuery = `${conceptTitle}\n${conceptSummary || ""}\n${String(userExplanation).slice(0, 600)}`;
+      const retrieval = await retrieveRelevantChunks({
+        userId,
+        documentId: record.documentId,
+        query: retrievalQuery,
+        topK: typeof topK === "number" ? topK : 5,
+        includeAdjacent: true,
+        maxContextChars: 8500,
       });
+      retrievedContext = retrieval.formattedContext;
+      citations = retrieval.citations;
+      retrievalLatencyMs = retrieval.latencyMs;
     }
 
-    // Append the primary evaluation prompt text
-    contents.push({ text: promptText });
+    if (!retrievedContext) {
+      // Fallback for edge cases where no indexed chunks exist (e.g., empty document)
+      const isBinaryFallback =
+        fileType === "application/pdf" ||
+        String(fileType || "").includes("presentation") ||
+        String(fileType || "").includes("powerpoint");
+      retrievedContext =
+        originalContent &&
+        typeof originalContent === "string" &&
+        !originalContent.startsWith("data:application/pdf") &&
+        !originalContent.startsWith("/api/") &&
+        !isBinaryFallback
+          ? originalContent.slice(0, 8000)
+          : `Concept: ${conceptTitle}\nSummary & Key Details: ${conceptSummary || ""}`;
+    }
 
-    const response = await generateContentWithFallback({
-      model: "gemini-3.5-flash",
-      contents: { parts: contents },
-      config: {
-        temperature: 0.1, // Lower temperature to ensure stable, non-random, deterministic grading scores
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            feedbackText: { type: Type.STRING, description: "Curious, supportive response in character as Feynman the student, with a follow-up question strictly based on the original document content." },
-            clarity: { type: Type.NUMBER, description: "Clarity score (0-100)" },
-            accuracy: { type: Type.NUMBER, description: "Accuracy score based on the original document (0-100)" },
-            simplicity: { type: Type.NUMBER, description: "Simplicity/10-year-old match score (0-100)" },
-            completeness: { type: Type.NUMBER, description: "Completeness score assessing coverage compared to the original document details (0-100)" },
-            gaps: { type: Type.ARRAY, items: { type: Type.STRING }, description: "List of identified gaps, missing points or unexplained jargon relative to the original source text." },
-            suggestions: { type: Type.STRING, description: "Actionable simplification and expansion tips related to the original document content" },
-          },
-          required: ["feedbackText", "clarity", "accuracy", "simplicity", "completeness", "gaps", "suggestions"],
-        },
-      },
+    const evalResult = await evaluateFeynmanWithRag({
+      conceptTitle: String(conceptTitle),
+      conceptSummary: String(conceptSummary || ""),
+      userExplanation: String(userExplanation),
+      retrievedContext,
+      previousChat: Array.isArray(previousChat) ? previousChat : [],
+      userDrawings: Array.isArray(userDrawings) ? userDrawings : [],
     });
 
-    const textOutput = response.text;
-    if (!textOutput) {
-      throw new Error("No response text from Gemini");
+    return res.json({
+      ...evalResult,
+      citations,
+      retrievalLatencyMs,
+    });
+  } catch (error) {
+    return handleRouteError(res, error, "Failed to evaluate explanation");
+  }
+});
+
+// 8. Grounded Flashcards Generation API
+app.post("/api/document/flashcards", async (req, res) => {
+  try {
+    const { userId } = await resolveRequestUser(req);
+    const { fileId, fileName, fileType, fileContent, concepts } = req.body || {};
+    const documentId = String(fileId || "").trim();
+
+    let record = documentId ? await awaitActiveIngestionIfPresent(userId, documentId) : null;
+    if ((!record || record.stage === "error") && fileContent && documentId) {
+      const { promise } = startDocumentIngestion({
+        userId,
+        documentId,
+        fileName: String(fileName || "Document"),
+        fileType: String(fileType || "text/plain"),
+        fileSize: typeof fileContent === "string" ? fileContent.length : 0,
+        textOrDataUrl: String(fileContent),
+      });
+      record = await promise;
     }
 
-    const result = JSON.parse(textOutput.trim());
-    res.json(result);
-  } catch (error: any) {
-    console.error("Error in Feynman evaluation:", error);
-    res.status(500).json({ error: error.message || "Failed to evaluate explanation" });
+    const conceptList =
+      record?.structure?.concepts?.length
+        ? record.structure.concepts
+        : Array.isArray(concepts)
+          ? concepts
+          : [];
+
+    let groundedContext = "";
+    if (record && record.stage === "ready") {
+      const query = conceptList.map((c: any) => `${c.title}: ${c.summary}`).join("\n");
+      const retrieval = await retrieveRelevantChunks({
+        userId,
+        documentId: record.documentId,
+        query: query || String(fileName || "core concepts"),
+        topK: 7,
+        includeAdjacent: false,
+        maxContextChars: 7500,
+      });
+      groundedContext = retrieval.formattedContext;
+    }
+
+    if (!groundedContext && typeof fileContent === "string" && !fileContent.startsWith("data:")) {
+      groundedContext = fileContent.slice(0, 7500);
+    }
+
+    const flashcards = await generateFlashcardsWithRag({
+      fileName: String(fileName || record?.fileName || "Study Material"),
+      concepts: conceptList.map((c: any) => ({
+        title: String(c.title || ""),
+        summary: String(c.summary || ""),
+      })),
+      groundedContext:
+        groundedContext ||
+        conceptList.map((c: any) => `${c.title}: ${c.summary}`).join("\n"),
+    });
+
+    return res.json({ flashcards });
+  } catch (error) {
+    return handleRouteError(res, error, "Failed to generate flashcards");
+  }
+});
+
+// 9. Contextual Sources Curation API (grounded in RAG structure + retrieved chunks)
+app.post("/api/document/sources", async (req, res) => {
+  try {
+    const { userId } = await resolveRequestUser(req);
+    const { fileId, fileName, fileType, fileContent, concepts, searchQuery } = req.body || {};
+    const documentId = String(fileId || "").trim();
+
+    let record = documentId ? await awaitActiveIngestionIfPresent(userId, documentId) : null;
+    if ((!record || record.stage === "error") && fileContent && documentId) {
+      const { promise } = startDocumentIngestion({
+        userId,
+        documentId,
+        fileName: String(fileName || "Document"),
+        fileType: String(fileType || "text/plain"),
+        fileSize: typeof fileContent === "string" ? fileContent.length : 0,
+        textOrDataUrl: String(fileContent),
+      });
+      record = await promise;
+    }
+
+    const conceptList =
+      record?.structure?.concepts?.length
+        ? record.structure.concepts
+        : Array.isArray(concepts)
+          ? concepts
+          : [];
+
+    let groundedContext = "";
+    if (record && record.stage === "ready") {
+      const query =
+        (searchQuery ? `${searchQuery}\n` : "") +
+        conceptList.map((c: any) => `${c.title}: ${c.summary}`).join("\n");
+      const retrieval = await retrieveRelevantChunks({
+        userId,
+        documentId: record.documentId,
+        query: query || String(fileName || "study material"),
+        topK: 6,
+        includeAdjacent: false,
+        maxContextChars: 6500,
+      });
+      groundedContext = retrieval.formattedContext;
+    }
+
+    const curated = await curateSourcesWithRag({
+      fileName: String(fileName || record?.fileName || "Study Material"),
+      concepts: conceptList.map((c: any) => ({
+        title: String(c.title || ""),
+        summary: String(c.summary || ""),
+      })),
+      groundedContext:
+        groundedContext ||
+        conceptList.map((c: any) => `${c.title}: ${c.summary}`).join("\n"),
+      searchQuery: typeof searchQuery === "string" ? searchQuery : undefined,
+    });
+
+    return res.json(curated);
+  } catch (error) {
+    return handleRouteError(res, error, "Failed to curate external sources");
   }
 });
 
 // Vite & Static Asset Handling
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
-    // Development mode
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
   } else {
-    // Production mode
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
