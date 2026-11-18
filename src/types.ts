@@ -39,6 +39,19 @@ export interface FeynmanSession {
   };
 }
 
+export interface Flashcard {
+  id: string;
+  conceptTitle: string;
+  cardType?: "mcq" | "fill_blank";
+  question: string;
+  answer: string;
+  difficulty?: "Easy" | "Medium" | "Hard";
+  options?: string[];
+  explanation?: string;
+  explainWhy?: string;
+  whatAbout?: string;
+}
+
 export interface UserProfile {
   uid: string;
   name: string;
@@ -52,5 +65,23 @@ export interface UserProfile {
   createdAt: string;
   lastLogin: string;
   settings: Record<string, any>;
+}
+
+export type ResourceCategory = "All" | "Articles" | "Documentation" | "Videos" | "Research Papers" | "Further Reading";
+
+export interface StudyResource {
+  id: string;
+  title: string;
+  description: string;
+  url: string;
+  source: string;
+  type: "Articles" | "Documentation" | "Videos" | "Research Papers" | "Further Reading";
+  relevanceReason: string;
+}
+
+export interface SourcesResponse {
+  aiExplanation: string;
+  topics: string[];
+  resources: StudyResource[];
 }
 

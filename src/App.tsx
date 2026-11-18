@@ -25,10 +25,13 @@ export default function App() {
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       setCurrentUser(user);
+      setActiveFile(null); // Reset active file view when changing users/accounts to prevent state bleeding
+      
       if (user) {
         getUploadedFilesFromFirestore(user.uid).then((cloudFiles) => {
-          // Retrieve what we currently have in local state / local storage
-          const cached = localStorage.getItem("feynman_uploaded_files") || localStorage.getItem("feymann_uploaded_files");
+          // Retrieve what we currently have in local state / local storage for this specific user
+          const userKey = `feynman_uploaded_files_${user.uid}`;
+          const cached = localStorage.getItem(userKey);
           let localFiles: UploadedFile[] = [];
           if (cached) {
             try {
@@ -38,24 +41,34 @@ export default function App() {
             }
           }
 
-          // Combine cloud files with any local files not yet in cloud files
+          // Combine cloud files with any user-specific local files not yet in cloud files
           const cloudIds = new Set(cloudFiles.map(f => f.id));
           const uniqueLocal = localFiles.filter(f => !cloudIds.has(f.id));
           const combined = [...cloudFiles, ...uniqueLocal];
 
+          setFiles(combined);
           if (combined.length > 0) {
-            setFiles(combined);
             // Save local unique ones back to firestore for persistent syncing
             uniqueLocal.forEach((f) => {
               saveUploadedFileToFirestore(user.uid, f.id, f.name, f.content, f.knowledgeMap || "", []);
             });
-            localStorage.setItem("feynman_uploaded_files", JSON.stringify(combined));
+            localStorage.setItem(userKey, JSON.stringify(combined));
           } else {
-            setFiles([]);
+            localStorage.setItem(userKey, JSON.stringify([]));
           }
         });
       } else {
-        const cached = localStorage.getItem("feynman_uploaded_files") || localStorage.getItem("feymann_uploaded_files");
+        // Retrieve guest files from isolated guest storage key
+        const guestKey = "feynman_uploaded_files_guest";
+        let cached = localStorage.getItem(guestKey);
+        if (!cached) {
+          // Fallback to legacy key to migrate existing users once
+          cached = localStorage.getItem("feynman_uploaded_files") || localStorage.getItem("feymann_uploaded_files");
+          if (cached) {
+            localStorage.setItem(guestKey, cached);
+          }
+        }
+        
         if (cached) {
           try {
             const parsedFiles = JSON.parse(cached);
@@ -63,6 +76,8 @@ export default function App() {
           } catch (e) {
             console.error("Failed to restore cached files", e);
           }
+        } else {
+          setFiles([]);
         }
       }
     });
@@ -72,7 +87,8 @@ export default function App() {
   // Save files to localStorage & Firestore whenever list changes
   const saveFiles = (updatedFiles: UploadedFile[]) => {
     setFiles(updatedFiles);
-    localStorage.setItem("feynman_uploaded_files", JSON.stringify(updatedFiles));
+    const key = auth.currentUser ? `feynman_uploaded_files_${auth.currentUser.uid}` : "feynman_uploaded_files_guest";
+    localStorage.setItem(key, JSON.stringify(updatedFiles));
     
     if (auth.currentUser) {
       updatedFiles.forEach((f) => {
@@ -237,6 +253,7 @@ export default function App() {
         {activeFile ? (
           <FeynmanArena
             file={activeFile}
+            allFiles={files}
             onBack={() => setActiveFile(null)}
             isSidebarCollapsed={isSidebarCollapsed}
             onToggleSidebar={toggleSidebarCollapse}
